@@ -47,6 +47,7 @@ const ADMIN_TITLES = {
   overview: ['概览', '系统状态与任务'],
   users: ['用户与权限', '角色、状态与会话失效'],
   instruments: ['标的库', '跨资产类型的主数据：股票 / 基金 / 债券 / 期货 / 外汇 / 加密'],
+  entities: ['主数据管理', '交易账户 / 策略实例 / 风控档案 / 数据源 · schema 驱动 + AI 辅助'],
   config: ['系统配置', '在线编辑并按正式加载器校验'],
   data: ['数据管理', '历史行情下载与运行清理'],
   risk: ['风控开关', '紧急停机与恢复'],
@@ -65,6 +66,7 @@ function switchAdminView(name) {
   if (name === 'overview') adminLoadOverview();
   else if (name === 'users') adminLoadUsers();
   else if (name === 'instruments') adminLoadInstruments();
+  else if (name === 'entities') adminLoadEntities();
   else if (name === 'config') adminLoadConfig();
   else if (name === 'data') { adminLoadJobs(); adminLoadRuns(); }
   else if (name === 'risk') adminLoadRisk();
@@ -726,6 +728,362 @@ function instBatchModal() {
 }
 
 /* ------------------------------------------------------------------ */
+/* 主数据管理（schema 驱动）                                            */
+/* ------------------------------------------------------------------ */
+const EntState = { entities: [], spec: null, items: [], editing: null, aiMode: 'local' };
+
+async function adminLoadEntities() {
+  const d = await api('/api/admin/entities');
+  EntState.entities = d.items || [];
+  EntState.aiMode = (d.ai && d.ai.mode) || 'local';
+
+  const badge = $('#aiBadge');
+  badge.textContent = EntState.aiMode === 'llm' ? 'AI: 大模型' : 'AI: 本地规则';
+  badge.className = 'badge ' + (EntState.aiMode === 'llm' ? 'ok' : 'warn');
+  $('#aiMode').textContent = EntState.aiMode === 'llm'
+    ? `模型 ${d.ai.model}`
+    : '未配置模型，使用确定性规则';
+
+  const sel = $('#entSelect');
+  const current = sel.value;
+  sel.innerHTML = EntState.entities
+    .map(e => `<option value="${e.key}">${e.icon || ''} ${e.label}</option>`)
+    .join('');
+  if (current && EntState.entities.some(e => e.key === current)) sel.value = current;
+
+  await adminLoadEntityRows();
+}
+
+async function adminLoadEntityRows() {
+  const key = $('#entSelect').value;
+  if (!key) return;
+  const q = $('#entQuery').value.trim();
+  const qs = q ? '?q=' + encodeURIComponent(q) : '';
+
+  const d = await api(`/api/admin/entities/${key}${qs}`);
+  EntState.spec = d.spec;
+  EntState.items = d.items || [];
+  $('#entDesc').textContent = d.spec.description;
+  renderEntTable();
+}
+
+function entEnumLabel(field, value) {
+  const opt = (field.options || []).find(o => String(o.value) === String(value));
+  return opt ? opt.label : value;
+}
+
+function entCell(field, value) {
+  if (value === null || value === undefined || value === '') return '<span class="dim">—</span>';
+  if (field.type === 'bool') {
+    return `<span class="badge ${value ? 'ok' : 'bad'}">${value ? '是' : '否'}</span>`;
+  }
+  if (field.type === 'enum') return `<span class="badge">${entEnumLabel(field, value)}</span>`;
+  if (field.type === 'json') {
+    const text = JSON.stringify(value);
+    return `<span class="mono" style="font-size:11px">${text.length > 40 ? text.slice(0, 40) + '…' : text}</span>`;
+  }
+  return String(value).length > 40 ? String(value).slice(0, 40) + '…' : String(value);
+}
+
+function renderEntTable() {
+  const spec = EntState.spec;
+  if (!spec) return;
+  const show = spec.fields.filter(f => f.name !== 'note').slice(0, 6);
+  const columns = show.map(f => ({
+    title: f.label,
+    render: r => entCell(f, r[f.name]),
+  }));
+  columns.push({
+    title: '操作', align: 'right',
+    render: r => `<button class="btn sm ghost" data-ent-edit="${r.id}">编辑</button>` +
+                 `<button class="btn sm danger" data-ent-del="${r.id}" data-ent-name="${r.name || r.id}">删除</button>`,
+  });
+
+  renderTable($('#entTable'), columns, EntState.items, '暂无数据，点右上角「新增」');
+  $('#entSummary').textContent = `共 ${EntState.items.length} 条`;
+
+  $$('[data-ent-edit]').forEach(btn => {
+    btn.onclick = () => {
+      const item = EntState.items.find(i => String(i.id) === btn.dataset.entEdit);
+      if (item) entModal(item);
+    };
+  });
+  $$('[data-ent-del]').forEach(btn => {
+    btn.onclick = async () => {
+      const name = btn.dataset.entName;
+      if (!confirm(`删除「${name}」？`)) return;
+      try {
+        const r = await api(`/api/admin/entities/${EntState.spec.key}/${btn.dataset.entDel}`, { method: 'DELETE' });
+        const ex = await aiExplain('delete', true, `已删除 ${name}`, [], r.item);
+        toast('已删除', 'ok');
+        showExplanation('#aiResultBox', ex);
+        adminLoadEntityRows();
+      } catch (err) {
+        toast(err.message, 'err');
+      }
+    };
+  });
+}
+
+function entFieldInput(field, value) {
+  const id = 'ef_' + field.name;
+  const v = value !== undefined && value !== null ? value : (field.default ?? '');
+  const attrs = `id="${id}" data-name="${field.name}"`;
+
+  if (field.type === 'bool') {
+    return `<select ${attrs}>
+      <option value="true" ${v ? 'selected' : ''}>是</option>
+      <option value="false" ${!v ? 'selected' : ''}>否</option></select>`;
+  }
+  if (field.type === 'enum') {
+    const opts = (field.options || [])
+      .map(o => `<option value="${o.value}" ${String(v) === String(o.value) ? 'selected' : ''}>${o.label}</option>`)
+      .join('');
+    return `<select ${attrs}>${opts}</select>`;
+  }
+  if (field.type === 'json' || field.type === 'text') {
+    const text = field.type === 'json'
+      ? (typeof v === 'string' ? v : JSON.stringify(v ?? {}))
+      : String(v ?? '');
+    return `<textarea ${attrs} rows="${field.type === 'json' ? 3 : 2}"
+      placeholder='${field.placeholder || ''}'>${text}</textarea>`;
+  }
+  const inputType = (field.type === 'int' || field.type === 'float') ? 'number' : 'text';
+  const step = field.type === 'float' ? 'step="any"' : '';
+  return `<input ${attrs} type="${inputType}" ${step} value="${v ?? ''}" placeholder="${field.placeholder || ''}" />`;
+}
+
+function entModal(item) {
+  const spec = EntState.spec;
+  EntState.editing = item || null;
+  const isEdit = !!item;
+
+  const body = spec.fields
+    .filter(f => !f.readonly)
+    .map(f => `<div class="field" style="margin-bottom:10px">
+        <label>${f.label}${f.required ? ' *' : ''}</label>
+        ${entFieldInput(f, item ? item[f.name] : undefined)}
+        ${f.help ? `<span class="dim" style="font-size:11px">${f.help}</span>` : ''}
+      </div>`)
+    .join('');
+
+  openModal(
+    `<h3>${isEdit ? '编辑' : '新增'}${spec.label}</h3>
+     <div style="max-height:56vh;overflow:auto;padding-right:4px">${body}</div>
+     <div id="entIssues" style="margin-top:6px;font-size:12px"></div>
+     <div id="entAiHints" style="margin-top:6px;font-size:12px"></div>
+     <div class="actions">
+       <button class="btn" id="entCancel">取消</button>
+       <button class="btn ghost" id="entAiFill">AI 填充</button>
+       <button class="btn ghost" id="entAiFix">AI 纠错</button>
+       <button class="btn primary" id="entSave">${isEdit ? '保存' : '添加'}</button>
+     </div>`,
+    () => {
+      $('#entCancel').onclick = closeModal;
+      $$('[data-name]', $('#modalBox')).forEach(el => {
+        el.oninput = () => entScheduleValidate();
+        el.onchange = () => entScheduleValidate();
+      });
+      $('#entAiFill').onclick = entAiFill;
+      $('#entAiFix').onclick = entAiFix;
+      $('#entSave').onclick = entSave;
+      setTimeout(entValidate, 150);
+    }
+  );
+}
+
+function entCollect() {
+  const out = {};
+  const spec = EntState.spec;
+  $$('[data-name]', $('#modalBox')).forEach(el => {
+    const field = spec.fields.find(f => f.name === el.dataset.name);
+    if (!field) return;
+    if (field.type === 'bool') out[field.name] = el.value === 'true';
+    else if (field.type === 'int' || field.type === 'float') out[field.name] = el.value === '' ? null : Number(el.value);
+    else out[field.name] = el.value;
+  });
+  return out;
+}
+
+let entValidateTimer = null;
+function entScheduleValidate() {
+  clearTimeout(entValidateTimer);
+  entValidateTimer = setTimeout(entValidate, 350);
+}
+
+async function entValidate() {
+  const body = { ...entCollect(), _id: EntState.editing ? EntState.editing.id : undefined };
+  try {
+    const r = await api(`/api/admin/entities/${EntState.spec.key}/validate`, { method: 'POST', body });
+    const issues = r.issues || [];
+    const dup = r.duplicate;
+    $('#entIssues').innerHTML = [
+      ...issues.map(i => `<div class="down">• ${i.field}：${i.message}</div>`),
+      ...(dup ? [`<div class="down">• ${dup.message}</div>`] : []),
+    ].join('') || '<div class="up">• 校验通过</div>';
+    return r.valid;
+  } catch (err) {
+    $('#entIssues').innerHTML = `<div class="down">• ${err.message}</div>`;
+    return false;
+  }
+}
+
+async function entSave() {
+  const payload = entCollect();
+  const valid = await entValidate();
+  if (!valid) {
+    const ex = await aiExplain(
+      EntState.editing ? 'update' : 'create', false,
+      '提交前校验未通过', [], payload,
+    );
+    showExplanation('#entAiHints', ex);
+    toast('请先修正校验问题（可点「AI 纠错」）', 'err');
+    return;
+  }
+  const key = EntState.spec.key;
+  try {
+    const r = EntState.editing
+      ? await api(`/api/admin/entities/${key}/${EntState.editing.id}`, { method: 'PATCH', body: payload })
+      : await api(`/api/admin/entities/${key}`, { method: 'POST', body: payload });
+    const ex = await aiExplain(EntState.editing ? 'update' : 'create', true, `已保存 ${r.item.name || r.item.id}`, [], r.item);
+    toast('已保存', 'ok');
+    closeModal();
+    showExplanation('#aiResultBox', ex);
+    adminLoadEntityRows();
+  } catch (err) {
+    const issues = err.details || [];
+    $('#entIssues').innerHTML = issues.map(i => `<div class="down">• ${i.field}：${i.message}</div>`).join('')
+      || `<div class="down">• ${err.message}</div>`;
+    const ex = await aiExplain(EntState.editing ? 'update' : 'create', false, err.message, issues, payload);
+    showExplanation('#entAiHints', ex);
+    toast(err.message, 'err');
+  }
+}
+
+async function entAiFill() {
+  const hint = prompt('用一句话描述这条数据（例如：币安主账户，合约，5 倍杠杆）');
+  if (hint === null) return;
+  try {
+    const r = await api('/api/admin/ai/suggest', {
+      method: 'POST',
+      body: { entity: EntState.spec.key, partial: entCollect(), hint },
+    });
+    Object.entries(r.values || {}).forEach(([name, value]) => {
+      const el = $('#ef_' + name);
+      if (!el) return;
+      if (el.type === 'checkbox') el.checked = !!value;
+      else if (typeof value === 'object') el.value = JSON.stringify(value);
+      else el.value = String(value);
+    });
+    $('#entAiHints').innerHTML =
+      `<div class="dim">[${r.mode === 'llm' ? '大模型' : '本地规则'}] ${(r.notes || []).join('；')}</div>`;
+    entScheduleValidate();
+    toast('已填充建议值', 'ok');
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+async function entAiFix() {
+  try {
+    const r = await api('/api/admin/ai/fix', {
+      method: 'POST',
+      body: { entity: EntState.spec.key, payload: entCollect() },
+    });
+    Object.entries(r.payload || {}).forEach(([name, value]) => {
+      const el = $('#ef_' + name);
+      if (!el) return;
+      el.value = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    });
+    const changes = (r.changes || []).map(c => `${c.field}: ${c.from} → ${c.to}（${c.why}）`).join('<br />');
+    const left = (r.unresolved || []).map(u => `${u.field}: ${u.message}`).join('<br />');
+    $('#entAiHints').innerHTML =
+      `<div class="dim">[${r.mode === 'llm' ? '大模型' : '本地规则'}] 已修复：<br />${changes || '无'}` +
+      (left ? `<br /><span class="down">仍需人工处理：<br />${left}</span>` : '') + '</div>';
+    entScheduleValidate();
+    toast('已尝试自动修复', 'ok');
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+/* ---------------- AI：自然语言增改 + 结果解读 ---------------- */
+async function aiExplain(action, ok, message, issues, data) {
+  try {
+    return await api('/api/admin/ai/explain', {
+      method: 'POST',
+      body: {
+        entity: EntState.spec ? EntState.spec.key : '',
+        action, ok, message, issues,
+        data: data || null,
+      },
+    });
+  } catch {
+    return { summary: message, suggestions: [], severity: ok ? 'ok' : 'error' };
+  }
+}
+
+function showExplanation(selector, ex) {
+  const host = $(selector);
+  if (!host || !ex) return;
+  const color = ex.severity === 'error' ? 'down' : ex.severity === 'warn' ? 'dim' : 'up';
+  host.innerHTML =
+    `<div class="${color}">${ex.summary || ''}</div>` +
+    (ex.suggestions && ex.suggestions.length
+      ? `<ul style="margin:6px 0 0 16px;padding:0">${ex.suggestions.map(s => `<li>${s}</li>`).join('')}</ul>`
+      : '');
+}
+
+async function aiParseCommand() {
+  const text = $('#aiCommand').value.trim();
+  if (!text) { toast('请先输入指令', 'err'); return; }
+  try {
+    const r = await api('/api/admin/ai/command', { method: 'POST', body: { text } });
+    const plan = r.plan || {};
+    const issues = r.preview_issues || [];
+    const actionLabel = { create: '新增', update: '修改', delete: '删除', list: '查询' }[plan.action] || plan.action;
+
+    $('#aiPlanBox').innerHTML =
+      `<div class="hint-box" style="margin-bottom:8px">
+        <b>${actionLabel} · ${plan.entity || '未识别'}</b>${plan.id ? ` · id=${plan.id}` : ''}<br />
+        ${plan.summary || ''}
+        ${(plan.warnings || []).map(w => `<div class="down">! ${w}</div>`).join('')}
+        ${issues.length ? `<div class="down">预览校验：${issues.map(i => i.message).join('；')}</div>` : ''}
+        <div class="dim" style="margin-top:6px">来源：${r.mode === 'llm' ? '大模型' : '本地规则'}（置信度 ${r.confidence ?? '-'}）</div>
+      </div>
+      <button class="btn primary sm" id="aiApplyBtn" ${issues.length ? 'disabled' : ''}>确认执行</button>
+      <button class="btn sm ghost" id="aiFillPlanBtn">填入表单</button>`;
+
+    $('#aiFillPlanBtn').onclick = () => {
+      if (plan.entity && plan.entity !== EntState.spec?.key) {
+        $('#entSelect').value = plan.entity;
+        adminLoadEntityRows().then(() => entModal(null));
+      } else {
+        entModal(null);
+      }
+      setTimeout(() => {
+        Object.entries(plan.data || {}).forEach(([name, value]) => {
+          const el = $('#ef_' + name);
+          if (el) el.value = typeof value === 'object' ? JSON.stringify(value) : String(value);
+        });
+      }, 300);
+    };
+
+    $('#aiApplyBtn').onclick = async () => {
+      try {
+        const applied = await api('/api/admin/ai/apply', { method: 'POST', body: { plan } });
+        toast('执行成功', 'ok');
+        showExplanation('#aiResultBox', applied.explanation);
+        $('#aiPlanBox').innerHTML = '';
+        adminLoadEntities();
+      } catch (err) {
+        const ex = (err.details && err.details.explanation) || await aiExplain(plan.action, false, err.message, [], null);
+        showExplanation('#aiResultBox', ex);
+        toast(err.message, 'err');
+      }
+    };
+  } catch (err) {
+    toast(err.message, 'err');
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* 初始化                                                              */
 /* ------------------------------------------------------------------ */
 window.initAdmin = function initAdmin() {
@@ -739,6 +1097,13 @@ window.initAdmin = function initAdmin() {
   $$('.nav-item[data-view]').forEach(el => el.addEventListener('click', () => switchAdminView(el.dataset.view)));
 
   $('#newUserBtn').onclick = adminNewUser;
+
+  // 主数据管理
+  $('#entSelect').onchange = adminLoadEntityRows;
+  $('#entRefresh').onclick = adminLoadEntityRows;
+  $('#entNew').onclick = () => entModal(null);
+  $('#entQuery').addEventListener('keydown', e => { if (e.key === 'Enter') adminLoadEntityRows(); });
+  $('#aiParseBtn').onclick = aiParseCommand;
 
   // 标的库
   $('#instNewBtn').onclick = () => instModal(null);

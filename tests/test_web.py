@@ -409,6 +409,149 @@ class TestInstrumentsApi(WebTestCase):
         self.assertEqual(payload["error"]["code"], "DATA_MISSING")
 
 
+class TestGenericAdmin(WebTestCase):
+    """schema 驱动的通用数据管理 + AI 辅助接口。"""
+
+    def setUp(self) -> None:
+        self.token = self.login("admin", "admin-pass-123")
+
+    def call_api(self, method, path, body=None):
+        return self.call(method, path, body=body, token=self.token)
+
+    def _clean(self, entity: str) -> None:
+        _, listing = self.call_api("GET", f"/api/admin/entities/{entity}")
+        for item in listing["data"]["items"]:
+            self.call_api("DELETE", f"/api/admin/entities/{entity}/{item['id']}")
+
+    def test_catalog_lists_entities_and_ai_mode(self) -> None:
+        status, payload = self.call_api("GET", "/api/admin/entities")
+        self.assertEqual(status, 200)
+        keys = {e["key"] for e in payload["data"]["items"]}
+        self.assertEqual(
+            keys, {"broker_accounts", "strategy_instances", "risk_profiles", "data_sources"}
+        )
+        self.assertIn(payload["data"]["ai"]["mode"], ("local", "llm"))
+        # 每个实体的字段都要带前端渲染所需的元数据
+        for entity in payload["data"]["items"]:
+            for field in entity["fields"]:
+                self.assertIn("label", field)
+                self.assertIn("type", field)
+
+    def test_crud_roundtrip(self) -> None:
+        self._clean("broker_accounts")
+        body = {"name": "test-acc", "venue": "BINANCE", "api_key_env": "BINANCE_API_KEY", "leverage": "5"}
+
+        status, payload = self.call_api("POST", "/api/admin/entities/broker_accounts", body)
+        self.assertEqual(status, 200, payload)
+        rid = payload["data"]["item"]["id"]
+        self.assertAlmostEqual(payload["data"]["item"]["leverage"], 5.0)
+
+        status, listing = self.call_api("GET", "/api/admin/entities/broker_accounts")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(listing["data"]["items"]), 1)
+
+        status, payload = self.call_api(
+            "PATCH", f"/api/admin/entities/broker_accounts/{rid}", {"enabled": False}
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertIs(payload["data"]["item"]["enabled"], False)
+        self.assertEqual(payload["data"]["item"]["name"], "test-acc")
+
+        status, _ = self.call_api("DELETE", f"/api/admin/entities/broker_accounts/{rid}")
+        self.assertEqual(status, 200)
+        status, _ = self.call_api("DELETE", f"/api/admin/entities/broker_accounts/{rid}")
+        self.assertEqual(status, 404)
+
+    def test_validation_error_has_field_details(self) -> None:
+        status, payload = self.call_api(
+            "POST", "/api/admin/entities/risk_profiles", {"name": "x", "risk_per_trade": 9}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "VALIDATION_FAILED")
+        self.assertTrue(payload["error"]["details"])
+
+    def test_duplicate_returns_409(self) -> None:
+        self._clean("data_sources")
+        body = {"name": "ds1", "kind": "kline", "symbol": "BTCUSDT"}
+        self.assertEqual(self.call_api("POST", "/api/admin/entities/data_sources", body)[0], 200)
+        status, payload = self.call_api("POST", "/api/admin/entities/data_sources", body)
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"]["code"], "DUPLICATE")
+
+    def test_unknown_entity_404(self) -> None:
+        status, payload = self.call_api("GET", "/api/admin/entities/nope")
+        self.assertEqual(status, 404)
+
+    def test_validate_endpoint(self) -> None:
+        status, payload = self.call_api(
+            "POST", "/api/admin/entities/broker_accounts/validate",
+            {"name": "ok-acc", "venue": "BINANCE"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["data"]["valid"])
+        self.assertEqual(payload["data"]["normalized"]["api_key_env"], "BINANCE_API_KEY")
+
+    def test_ai_suggest(self) -> None:
+        status, payload = self.call_api(
+            "POST", "/api/admin/ai/suggest",
+            {"entity": "data_sources", "partial": {}, "hint": "新增 symbol=ETHUSDT 的数据源"},
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["data"]["values"].get("symbol"), "ETHUSDT")
+        self.assertIn(payload["data"]["mode"], ("local", "llm"))
+
+    def test_ai_fix_repairs_range(self) -> None:
+        status, payload = self.call_api(
+            "POST", "/api/admin/ai/fix",
+            {"entity": "data_sources",
+             "payload": {"name": "f1", "kind": "kline", "symbol": "BTCUSDT", "retention_days": 99999}},
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["data"]["payload"]["retention_days"], 3650)
+
+    def test_ai_command_then_apply(self) -> None:
+        self._clean("data_sources")
+        status, payload = self.call_api(
+            "POST", "/api/admin/ai/command",
+            {"text": "新增数据源 name=cmd-ds kind=kline symbol=BTCUSDT interval=1m"},
+        )
+        self.assertEqual(status, 200, payload)
+        plan = payload["data"]["plan"]
+        self.assertEqual(plan["entity"], "data_sources")
+        self.assertEqual(plan["action"], "create")
+        self.assertTrue(payload["data"]["requires_confirmation"])
+
+        status, applied = self.call_api("POST", "/api/admin/ai/apply", {"plan": plan})
+        self.assertEqual(status, 200, applied)
+        self.assertEqual(applied["data"]["result"]["name"], "cmd-ds")
+        self.assertIn("explanation", applied["data"])
+
+        _, listing = self.call_api("GET", "/api/admin/entities/data_sources")
+        self.assertEqual(len(listing["data"]["items"]), 1)
+
+    def test_ai_apply_rejects_bad_plan(self) -> None:
+        status, payload = self.call_api(
+            "POST", "/api/admin/ai/apply", {"plan": {"entity": "nope", "action": "create"}}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "VALIDATION_FAILED")
+
+    def test_ai_explain_failure(self) -> None:
+        status, payload = self.call_api(
+            "POST", "/api/admin/ai/explain",
+            {"entity": "data_sources", "action": "create", "ok": False,
+             "message": "名称重复", "issues": []},
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["data"]["severity"], "error")
+        self.assertTrue(payload["data"]["suggestions"])
+
+    def test_non_admin_blocked(self) -> None:
+        user_token = self.login("alice", "user-pass-123")
+        status, _ = self.call("GET", "/api/admin/entities", token=user_token)
+        self.assertEqual(status, 403)
+
+
 class TestStatic(WebTestCase):
     def test_index_served(self) -> None:
         url = f"http://127.0.0.1:{self.port}/"

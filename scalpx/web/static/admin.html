@@ -26,8 +26,9 @@
     <div class="nav-item active" data-view="overview"><span class="ico">▤</span>概览</div>
     <div class="nav-item" data-view="users"><span class="ico">☺</span>用户与权限</div>
     <div class="nav-item" data-view="instruments"><span class="ico">◆</span>标的库</div>
+    <div class="nav-item" data-view="entities"><span class="ico">▤</span>主数据管理</div>
     <div class="nav-item" data-view="config"><span class="ico">⚙</span>系统配置</div>
-    <div class="nav-item" data-view="data"><span class="ico">⇩</span>数据管理</div>
+    <div class="nav-item" data-view="data"><span class="ico">⇩</span>行情数据</div>
     <div class="nav-item" data-view="risk"><span class="ico">⛔</span>风控开关</div>
     <div class="nav-item" data-view="audit"><span class="ico">≡</span>审计日志</div>
     <div class="nav-item" data-view="system"><span class="ico">▦</span>系统信息</div>
@@ -96,6 +97,41 @@
         <div class="card pad0">
           <div class="table-wrap"><table id="instrumentTable"></table></div>
           <div class="card-body" style="padding-top:10px"><span class="dim" id="instSummary"></span></div>
+        </div>
+      </section>
+
+      <!-- 主数据管理（schema 驱动 + AI 辅助） -->
+      <section class="view" id="view-entities">
+        <div class="toolbar">
+          <div class="field" style="width:200px"><label>数据类型</label>
+            <select id="entSelect"></select></div>
+          <div class="field" style="width:200px"><label>搜索</label>
+            <input id="entQuery" type="text" placeholder="回车搜索" /></div>
+          <div class="grow"></div>
+          <span class="badge" id="aiBadge">AI: —</span>
+          <button class="btn" id="entRefresh">刷新</button>
+          <button class="btn primary" id="entNew">新增</button>
+        </div>
+        <div class="hint-box" id="entDesc">—</div>
+
+        <div class="grid g21">
+          <div class="card pad0">
+            <div class="table-wrap"><table id="entTable"></table></div>
+            <div class="card-body" style="padding-top:10px"><span class="dim" id="entSummary"></span></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>AI 助手</h3><div class="grow"></div>
+              <span class="dim" style="font-size:11px" id="aiMode">—</span></div>
+            <div class="field" style="margin-bottom:8px">
+              <label>用一句话描述要做什么</label>
+              <textarea id="aiCommand" rows="3"
+                placeholder="例如：新增数据源 name=demo kind=kline symbol=BTCUSDT interval=1m"></textarea>
+            </div>
+            <button class="btn" id="aiParseBtn" style="width:100%">解析为操作计划</button>
+            <div id="aiPlanBox" style="margin-top:10px;font-size:12px"></div>
+            <div id="aiResultBox" style="margin-top:10px;font-size:12px"></div>
+          </div>
         </div>
       </section>
 

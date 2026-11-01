@@ -77,6 +77,68 @@ CREATE TABLE IF NOT EXISTS instruments (
 );
 CREATE INDEX IF NOT EXISTS idx_inst_sort ON instruments(sort_order, id);
 CREATE INDEX IF NOT EXISTS idx_inst_type ON instruments(asset_type, market);
+
+CREATE TABLE IF NOT EXISTS broker_accounts (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL UNIQUE,
+    venue          TEXT NOT NULL,
+    account_type   TEXT NOT NULL DEFAULT 'futures',
+    api_key_env    TEXT NOT NULL DEFAULT '',
+    testnet        INTEGER NOT NULL DEFAULT 1,
+    leverage       REAL NOT NULL DEFAULT 3,
+    position_mode  TEXT NOT NULL DEFAULT 'oneway',
+    maker_fee_bps  REAL NOT NULL DEFAULT 2,
+    taker_fee_bps  REAL NOT NULL DEFAULT 4,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    note           TEXT NOT NULL DEFAULT '',
+    created_ts     INTEGER NOT NULL,
+    updated_ts     INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS strategy_instances (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL UNIQUE,
+    strategy       TEXT NOT NULL,
+    symbols        TEXT NOT NULL DEFAULT '',
+    timeframe      TEXT NOT NULL DEFAULT '1m',
+    params         TEXT NOT NULL DEFAULT '{}',
+    risk_profile   TEXT NOT NULL DEFAULT '',
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    note           TEXT NOT NULL DEFAULT '',
+    created_ts     INTEGER NOT NULL,
+    updated_ts     INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS risk_profiles (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                  TEXT NOT NULL UNIQUE,
+    risk_per_trade        REAL NOT NULL DEFAULT 0.0025,
+    max_positions         INTEGER NOT NULL DEFAULT 2,
+    max_leverage          REAL NOT NULL DEFAULT 3,
+    max_daily_loss_pct    REAL NOT NULL DEFAULT 0.025,
+    max_daily_trades      INTEGER NOT NULL DEFAULT 40,
+    consecutive_loss_halt INTEGER NOT NULL DEFAULT 5,
+    cooldown_minutes      INTEGER NOT NULL DEFAULT 30,
+    min_stop_pct          REAL NOT NULL DEFAULT 0.004,
+    max_stop_pct          REAL NOT NULL DEFAULT 0.008,
+    max_cost_ratio        REAL NOT NULL DEFAULT 0.35,
+    enabled               INTEGER NOT NULL DEFAULT 1,
+    note                  TEXT NOT NULL DEFAULT '',
+    created_ts            INTEGER NOT NULL,
+    updated_ts            INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS data_sources (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL UNIQUE,
+    kind           TEXT NOT NULL,
+    venue          TEXT NOT NULL,
+    symbol         TEXT NOT NULL,
+    interval       TEXT NOT NULL DEFAULT '1m',
+    path           TEXT NOT NULL DEFAULT '',
+    retention_days INTEGER NOT NULL DEFAULT 90,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    note           TEXT NOT NULL DEFAULT '',
+    created_ts     INTEGER NOT NULL,
+    updated_ts     INTEGER NOT NULL
+);
 """
 
 
@@ -239,6 +301,19 @@ class WebRepo:
             )
             self._conn.commit()
             return True, used + 1
+
+    # ------------------------------------------------------------------ #
+    # 通用访问（供 generic.EntityStore 使用）
+    # ------------------------------------------------------------------ #
+    @property
+    def connection(self) -> sqlite3.Connection:
+        if self._conn is None:
+            raise RuntimeError("WebRepo 未连接")
+        return self._conn
+
+    @property
+    def lock(self) -> threading.Lock:
+        return self._lock
 
     # ------------------------------------------------------------------ #
     # 标的库

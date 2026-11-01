@@ -33,6 +33,8 @@ from .auth import (
     issue_token,
     verify_password,
 )
+from .ai import AIAssistant, validate_plan
+from .generic import EntityError, EntityStore
 from .instruments import (
     canonical_key,
     parse_batch_text,
@@ -40,6 +42,7 @@ from .instruments import (
     validate_instrument,
 )
 from .repo import TradingRepo, WebRepo
+from .schema import ENTITIES, get_entity
 from .tomlio import dumps as toml_dumps
 
 # --------------------------------------------------------------------------- #
@@ -135,6 +138,19 @@ ROUTES: list[Route] = [
     ("PUT", re.compile(r"^/api/admin/instruments/order$"), "instruments_reorder", (ROLE_ADMIN,)),
     ("PATCH", re.compile(r"^/api/admin/instruments/(?P<iid>\d+)$"), "instruments_update", (ROLE_ADMIN,)),
     ("DELETE", re.compile(r"^/api/admin/instruments/(?P<iid>\d+)$"), "instruments_delete", (ROLE_ADMIN,)),
+    # --- 通用实体管理（schema 驱动） ---
+    ("GET", re.compile(r"^/api/admin/entities$"), "entities_catalog", (ROLE_ADMIN,)),
+    ("GET", re.compile(r"^/api/admin/entities/(?P<entity>[a-z_]+)$"), "entities_list", (ROLE_ADMIN,)),
+    ("POST", re.compile(r"^/api/admin/entities/(?P<entity>[a-z_]+)$"), "entities_create", (ROLE_ADMIN,)),
+    ("POST", re.compile(r"^/api/admin/entities/(?P<entity>[a-z_]+)/validate$"), "entities_validate", (ROLE_ADMIN,)),
+    ("PATCH", re.compile(r"^/api/admin/entities/(?P<entity>[a-z_]+)/(?P<rid>\d+)$"), "entities_update", (ROLE_ADMIN,)),
+    ("DELETE", re.compile(r"^/api/admin/entities/(?P<entity>[a-z_]+)/(?P<rid>\d+)$"), "entities_delete", (ROLE_ADMIN,)),
+    # --- AI 辅助 ---
+    ("POST", re.compile(r"^/api/admin/ai/suggest$"), "ai_suggest", (ROLE_ADMIN,)),
+    ("POST", re.compile(r"^/api/admin/ai/fix$"), "ai_fix", (ROLE_ADMIN,)),
+    ("POST", re.compile(r"^/api/admin/ai/command$"), "ai_command", (ROLE_ADMIN,)),
+    ("POST", re.compile(r"^/api/admin/ai/apply$"), "ai_apply", (ROLE_ADMIN,)),
+    ("POST", re.compile(r"^/api/admin/ai/explain$"), "ai_explain", (ROLE_ADMIN,)),
     # --- 后台 ---
     ("GET", re.compile(r"^/api/admin/users$"), "users_list", (ROLE_ADMIN,)),
     ("POST", re.compile(r"^/api/admin/users$"), "users_create", (ROLE_ADMIN,)),
@@ -177,6 +193,27 @@ class Api:
         self.started_ts = time.time()
         self.config_dir = self.root / "config"
         self.kill_file = self.root / "data" / "KILL"
+        self.store = EntityStore(web)
+        self.ai = AIAssistant()
+        self._register_dynamic_options()
+
+    def _register_dynamic_options(self) -> None:
+        """把运行时可枚举的选项注入 schema（策略名等），避免硬编码。"""
+        spec = ENTITIES.get("strategy_instances")
+        if spec is None:
+            return
+        field = spec.field_spec("strategy")
+        if field is None:
+            return
+        try:
+            # 从包级导出导入，触发策略注册（registry 单独导入不会执行注册）
+            from ..strategy import available
+
+            names = list(available())
+        except Exception:  # noqa: BLE001 - 策略注册表异常不应拖垮后台
+            names = []
+        if names:
+            field.options = [{"value": n, "label": n} for n in names]
 
     # ------------------------------------------------------------------ #
     # 分发
@@ -969,6 +1006,7 @@ class Api:
             },
             "microstructure": flow,
             "instruments": {"count": self.web.instrument_count()},
+            "ai": self.ai.status(),
             "risk": {"kill_switch": self.kill_file.exists()},
             "configs": sorted(p.stem for p in self.config_dir.glob("*.toml")),
             "jobs": self._jobs_all()[:20],
@@ -1068,6 +1106,192 @@ class Api:
             detail=reason, ip=req.ip,
         )
         return {"action": action, "kill_switch": self.kill_file.exists(), "reason": reason}
+
+    # ------------------------------------------------------------------ #
+    # 通用实体管理（schema 驱动）
+    # ------------------------------------------------------------------ #
+    def _entity(self, req: Request):
+        key = req.params.get("entity", "")
+        spec = get_entity(key)
+        if spec is None:
+            raise ApiError("NOT_FOUND", f"未知数据类型：{key}", 404)
+        return spec
+
+    @staticmethod
+    def _raise_entity_error(exc: EntityError):
+        raise ApiError(
+            exc.code,
+            exc.message,
+            exc.status,
+            details=[i.as_dict() for i in exc.issues] or None,
+        )
+
+    def h_entities_catalog(self, req: Request) -> dict:
+        from .schema import entity_catalog
+
+        return {"items": entity_catalog(), "ai": self.ai.status()}
+
+    def h_entities_list(self, req: Request) -> dict:
+        spec = self._entity(req)
+        items = self.store.list(spec, q=req.q("q"), limit=req.q_int("limit", 200, lo=1, hi=1000))
+        return {"entity": spec.key, "spec": spec.as_dict(), "items": items, "total": len(items)}
+
+    def h_entities_create(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        spec = self._entity(req)
+        try:
+            item = self.store.create(spec, req.body)
+        except EntityError as exc:
+            self._raise_entity_error(exc)
+            raise  # pragma: no cover
+        self.web.audit(
+            uid=p.uid, username=p.username, action=f"{spec.key}_create",
+            target=str(item.get("id")), detail=str(item.get("name", "")), ip=req.ip,
+        )
+        return {"entity": spec.key, "item": item}
+
+    def h_entities_update(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        spec = self._entity(req)
+        rid = int(req.params["rid"])
+        try:
+            item = self.store.update(spec, rid, req.body)
+        except EntityError as exc:
+            self._raise_entity_error(exc)
+            raise  # pragma: no cover
+        self.web.audit(
+            uid=p.uid, username=p.username, action=f"{spec.key}_update",
+            target=str(rid), detail=str(item.get("name", "")), ip=req.ip,
+        )
+        return {"entity": spec.key, "item": item}
+
+    def h_entities_delete(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        spec = self._entity(req)
+        rid = int(req.params["rid"])
+        try:
+            item = self.store.delete(spec, rid)
+        except EntityError as exc:
+            self._raise_entity_error(exc)
+            raise  # pragma: no cover
+        self.web.audit(
+            uid=p.uid, username=p.username, action=f"{spec.key}_delete",
+            target=str(rid), detail=str(item.get("name", "")), ip=req.ip,
+        )
+        return {"entity": spec.key, "deleted": True, "item": item}
+
+    def h_entities_validate(self, req: Request) -> dict:
+        spec = self._entity(req)
+        rid = req.body.get("_id")
+        return {
+            "entity": spec.key,
+            **self.store.validate(
+                spec, req.body, partial=bool(req.body.get("_partial")),
+                rid=int(rid) if isinstance(rid, (int, str)) and str(rid).isdigit() else None,
+            ),
+        }
+
+    # ------------------------------------------------------------------ #
+    # AI 辅助
+    # ------------------------------------------------------------------ #
+    def _entity_for(self, req: Request):
+        key = str(req.body.get("entity") or "")
+        return get_entity(key)
+
+    def h_ai_suggest(self, req: Request) -> dict:
+        spec = self._entity_for(req)
+        if spec is None:
+            raise ApiError("BAD_REQUEST", "未知数据类型", 400)
+        partial = req.body.get("partial") or {}
+        if not isinstance(partial, dict):
+            raise ApiError("BAD_REQUEST", "partial 必须是对象")
+        return self.ai.suggest(spec, partial, str(req.body.get("hint") or ""))
+
+    def h_ai_fix(self, req: Request) -> dict:
+        spec = self._entity_for(req)
+        if spec is None:
+            raise ApiError("BAD_REQUEST", "未知数据类型", 400)
+        payload = req.body.get("payload") or {}
+        if not isinstance(payload, dict):
+            raise ApiError("BAD_REQUEST", "payload 必须是对象")
+        issues = self.store.validate(spec, payload)["issues"]
+        if not issues:
+            return {"mode": self.ai.status()["mode"], "payload": payload, "changes": [], "unresolved": []}
+        return self.ai.fix(spec, payload, issues)
+
+    def h_ai_command(self, req: Request) -> dict:
+        text = str(req.body.get("text") or "").strip()
+        if not text:
+            raise ApiError("BAD_REQUEST", "请输入指令", 400)
+        if len(text) > 500:
+            raise ApiError("BAD_REQUEST", "指令过长（上限 500 字）", 400)
+        result = self.ai.command(text)
+        plan = result.get("plan") or {}
+        # 预览：把计划跑一遍 schema 校验，让用户在确认前就看到会不会失败
+        _, issues = validate_plan(plan)
+        spec = ENTITIES.get(str(plan.get("entity") or ""))
+        preview: list[dict] = [i.as_dict() for i in issues]
+        if not preview and spec is not None and plan.get("action") in ("create", "update"):
+            preview = self.store.validate(spec, plan.get("data") or {})["issues"]
+        result["preview_issues"] = preview
+        result["requires_confirmation"] = True
+        return result
+
+    def h_ai_apply(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        raw_plan = req.body.get("plan") or {}
+        if not isinstance(raw_plan, dict):
+            raise ApiError("BAD_REQUEST", "plan 必须是对象", 400)
+        plan, issues = validate_plan(raw_plan)
+        if issues:
+            raise ApiError(
+                "VALIDATION_FAILED",
+                "；".join(f"{i.field}: {i.message}" for i in issues),
+                400,
+                details=[i.as_dict() for i in issues],
+            )
+
+        spec = ENTITIES[plan["entity"]]
+        action = plan["action"]
+        try:
+            if action == "create":
+                result = self.store.create(spec, plan["data"])
+            elif action == "update":
+                result = self.store.update(spec, plan["id"], plan["data"])
+            elif action == "delete":
+                result = self.store.delete(spec, plan["id"])
+            else:
+                result = self.store.list(spec, limit=200)
+        except EntityError as exc:
+            explanation = self.ai.explain(spec, action, False, exc.message, [i.as_dict() for i in exc.issues], None)
+            raise ApiError(
+                exc.code,
+                exc.message,
+                exc.status,
+                details={"issues": [i.as_dict() for i in exc.issues], "explanation": explanation},
+            ) from exc
+
+        self.web.audit(
+            uid=p.uid, username=p.username, action=f"ai_{action}",
+            target=spec.key, detail=plan.get("summary", "")[:200], ip=req.ip,
+        )
+        explanation = self.ai.explain(spec, action, True, plan.get("summary", ""), [], result)
+        return {"entity": spec.key, "action": action, "result": result, "explanation": explanation}
+
+    def h_ai_explain(self, req: Request) -> dict:
+        spec = self._entity_for(req)
+        action = str(req.body.get("action") or "")
+        ok = bool(req.body.get("ok"))
+        message = str(req.body.get("message") or "")
+        issues = req.body.get("issues") or []
+        data = req.body.get("data")
+        if not isinstance(issues, list):
+            issues = []
+        return self.ai.explain(spec, action, ok, message, issues, data)
 
     def h_run_delete(self, req: Request) -> dict:
         p = req.principal
