@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scalpx · 超短线交易控制台</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+
+<!-- ============ 登录 ============ -->
+<div class="login-wrap" id="loginView">
+  <form class="login-card" id="loginForm" autocomplete="off">
+    <h2>scalpx 控制台</h2>
+    <p class="sub">币安永续 · 超短线交易系统</p>
+    <div class="field">
+      <label for="loginUser">账号</label>
+      <input id="loginUser" type="text" placeholder="用户名" required />
+    </div>
+    <div class="field">
+      <label for="loginPass">口令</label>
+      <input id="loginPass" type="password" placeholder="口令" required />
+    </div>
+    <button class="btn primary" type="submit" style="width:100%;margin-top:6px">登录</button>
+    <div class="login-err" id="loginErr"></div>
+  </form>
+</div>
+
+<!-- ============ 主界面 ============ -->
+<div class="shell" id="appView" style="display:none">
+  <aside class="sidebar">
+    <div class="brand"><span class="dot"></span><div>scalpx<br /><small>ultra-short-term</small></div></div>
+
+    <div class="nav-item active" data-view="dashboard"><span class="ico">▤</span>总览</div>
+    <div class="nav-item" data-view="trades"><span class="ico">⇄</span>交易明细</div>
+    <div class="nav-item" data-view="signals"><span class="ico">◇</span>信号流</div>
+    <div class="nav-item" data-view="micro"><span class="ico">▦</span>微观结构</div>
+    <div class="nav-item" data-view="runs"><span class="ico">≡</span>运行记录</div>
+
+    <div class="nav-sep"></div>
+    <a class="nav-item" href="/admin" id="adminEntry" style="display:none"><span class="ico">⚙</span>后台管理</a>
+
+    <div class="spacer"></div>
+    <div class="foot">v1.0 · <span id="footVersion">—</span></div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="pageTitle">总览</h1>
+        <div class="sub" id="pageSub">—</div>
+      </div>
+      <div class="grow"></div>
+      <select id="runSelect" style="width:230px" title="选择运行批次"></select>
+      <button class="btn sm" id="refreshBtn">刷新</button>
+      <div class="user-chip">
+        <span id="userName">—</span>
+        <span class="role-badge" id="userRole">user</span>
+        <a href="#" id="logoutBtn" style="color:var(--text-mute)">退出</a>
+      </div>
+    </header>
+
+    <div class="content">
+
+      <!-- 总览 -->
+      <section class="view active" id="view-dashboard">
+        <div class="grid g4" style="margin-bottom:14px">
+          <div class="card"><div class="kpi"><span class="label">总收益</span><span class="value" id="kpiReturn">—</span><span class="hint" id="kpiEquity">—</span></div></div>
+          <div class="card"><div class="kpi"><span class="label">最大回撤</span><span class="value" id="kpiMdd">—</span><span class="hint">峰值到谷底</span></div></div>
+          <div class="card"><div class="kpi"><span class="label">胜率 / 盈亏比</span><span class="value" id="kpiWin">—</span><span class="hint" id="kpiPf">—</span></div></div>
+          <div class="card"><div class="kpi"><span class="label">期望 R</span><span class="value" id="kpiR">—</span><span class="hint" id="kpiTrades">—</span></div></div>
+        </div>
+
+        <div class="grid g21" style="margin-bottom:14px">
+          <div class="card">
+            <div class="card-head"><h3>权益曲线</h3><div class="grow"></div>
+              <div class="legend"><span><i style="background:#3ea6ff"></i>权益</span></div>
+            </div>
+            <canvas class="chart" id="equityChart"></canvas>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>出场分布</h3></div>
+            <div id="exitList" class="dim" style="font-size:13px">—</div>
+            <div class="card-head" style="margin-top:18px"><h3>风控事件</h3></div>
+            <div id="riskList" class="dim" style="font-size:12px;max-height:150px;overflow:auto">—</div>
+          </div>
+        </div>
+
+        <div class="card pad0">
+          <div class="card-head"><h3>最近交易</h3><div class="grow"></div>
+            <button class="btn sm ghost" data-view="trades">全部 →</button></div>
+          <div class="table-wrap"><table id="recentTrades"></table></div>
+        </div>
+      </section>
+
+      <!-- 交易明细 -->
+      <section class="view" id="view-trades">
+        <div class="toolbar">
+          <div class="field" style="width:180px"><label>标的</label>
+            <input id="tradeSymbol" type="text" placeholder="全部（如 BTCUSDT）" /></div>
+          <div class="field" style="width:140px"><label>每页</label>
+            <select id="tradeLimit"><option>50</option><option>100</option><option>200</option></select></div>
+          <div class="grow"></div>
+          <button class="btn" id="tradeQuery" style="align-self:flex-end">查询</button>
+        </div>
+        <div class="card pad0"><div class="table-wrap"><table id="tradeTable"></table></div>
+          <div class="card-body" style="padding-top:10px"><span class="dim" id="tradePager"></span></div>
+        </div>
+      </section>
+
+      <!-- 信号流 -->
+      <section class="view" id="view-signals">
+        <div class="hint-box">信号表记录了每一次入场判定：成交的、被风控拦截的、以及微观结构实际使用的数据源。</div>
+        <div class="card pad0"><div class="table-wrap"><table id="signalTable"></table></div></div>
+      </section>
+
+      <!-- 微观结构 -->
+      <section class="view" id="view-micro">
+        <div class="grid g3" style="margin-bottom:14px">
+          <div class="card"><div class="kpi"><span class="label">订单流覆盖</span><span class="value" id="microBars">—</span><span class="hint">per-bar 成交流</span></div></div>
+          <div class="card"><div class="kpi"><span class="label">盘口快照</span><span class="value" id="microBooks">—</span><span class="hint">depth20 录制</span></div></div>
+          <div class="card"><div class="kpi"><span class="label">累计成交笔数</span><span class="value" id="microTrades">—</span><span class="hint">aggTrade 聚合</span></div></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h3>CVD 累计净额</h3><div class="grow"></div>
+            <div class="field" style="width:150px"><input id="microSymbol" type="text" placeholder="BTCUSDT" /></div>
+            <button class="btn sm" id="microQuery">查询</button>
+          </div>
+          <canvas class="chart" id="cvdChart"></canvas>
+        </div>
+      </section>
+
+      <!-- 运行记录 -->
+      <section class="view" id="view-runs">
+        <div class="toolbar">
+          <div class="hint-box" style="margin:0">仅显示你有权限查看的运行。管理员可见全部。</div>
+          <div class="grow"></div>
+          <button class="btn primary" id="runBacktestBtn">运行新回测</button>
+        </div>
+        <div class="card pad0"><div class="table-wrap"><table id="runTable"></table></div></div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<div class="toast-host" id="toastHost"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,142 @@
+# ============================================================================
+# 实盘配置：真实资金。启动前请逐项核对 [live 上线检查清单](docs/04-operations.md)
+# 运行： python -m scalpx live --config config/live.toml --i-understand-live-risk
+# 必需： BINANCE_API_KEY / BINANCE_API_SECRET 环境变量（只开合约交易权限，禁止提币）
+# ============================================================================
+
+[run]
+name = "btc-live"
+mode = "live"
+output_dir = "runs"
+log_level = "INFO"
+seed = 7
+
+[market]
+symbols = ["BTCUSDT"]
+interval = "1m"
+market_type = "futures"
+price_tick = 0.1
+qty_step = 0.001
+min_qty = 0.001
+min_notional = 5.0
+
+[data]
+source = "sqlite"
+csv_dir = "data/raw"
+sqlite_path = "data/live.db"
+start = "2024-01-01"
+end = "2030-01-01"
+warmup_bars = 300
+persist = true
+
+[strategy]
+name = "trend_pullback"
+
+[strategy.params]
+ema_fast = 21
+ema_slow = 55
+ema_trend = 144
+trend_slope_lookback = 20
+rsi_period = 14
+atr_period = 14
+vol_period = 20
+pullback_lookback = 3
+pullback_atr_mult = 0.30
+rsi_cross = 50.0
+rsi_long_max = 70.0
+rsi_short_min = 30.0
+vol_mult = 1.10
+atr_min_pct = 0.0008
+atr_max_pct = 0.0060
+flow_mode = "auto"
+min_delta_ratio = 0.04
+min_cvd_slope = 0.0
+require_cvd_slope = true
+max_absorption = 0.85
+min_obi = 0.05              # 实盘启用盘口：要求买卖失衡至少 5%
+min_stack_score = 0.0       # 且不能出现逆向价格墙
+require_flow = true
+flow_min_long = 0.52
+flow_min_short = 0.48
+stop_atr_mult = 2.00
+rr = 1.50
+be_at_r = 1.00
+be_offset_r = 0.10
+trail_at_r = 1.50
+trail_atr_mult = 1.20
+max_hold_bars = 30
+trend_flip_exit = true
+allow_long = true
+allow_short = true
+
+[risk]
+# 实盘首月建议把风险再砍一半，用小资金验证执行链路
+risk_per_trade = 0.0010
+max_positions = 1
+max_positions_per_symbol = 1
+max_leverage = 3.0
+max_notional_pct = 2.0
+max_daily_loss_pct = 0.0100
+max_daily_trades = 20
+consecutive_loss_cooldown = 3
+cooldown_minutes = 60
+consecutive_loss_halt = 4
+min_stop_pct = 0.0040
+max_stop_pct = 0.0080
+max_bars_held = 40
+max_spread_bps = 3.0
+symbol_cooldown_bars = 5
+correlated_risk_factor = 1.5
+
+[execution]
+entry_order_type = "limit_post_only"
+entry_timeout_ms = 3000
+entry_max_retries = 2
+entry_offset_bps = 0.5
+maker_fee = 0.0002
+taker_fee = 0.0005      # 未持有 BNB 抵扣时的实际 taker 费率
+slippage_bps = 2.0
+latency_ms = 150
+use_exchange_stops = true
+stop_place_deadline_ms = 800
+reconcile_interval_s = 30
+max_order_reject_streak = 3
+tick_size_for_price = 0.1
+
+[microstructure]
+enabled = true
+use_agg_trades = true
+use_order_book = true
+depth_bps = 5.0
+obi_levels = 20
+cvd_window = 20
+max_book_age_ms = 1500       # 实盘对盘口新鲜度更敏感
+large_trade_usd = 50000.0
+stack_ratio = 3.0
+stack_range = 3
+min_level_qty = 0.0
+max_bad_ratio = 0.4
+gate_on_book_quality = true
+persist_flow = true
+persist_book = true          # 录制盘口 -> 可回放做盘口因子的样本外验证
+persist_book_interval_ms = 1000
+
+[backtest]
+initial_equity = 1000.0
+intrabar_path = "ohlc"
+pessimistic_intrabar = true
+funding_bps_per_8h = 0.0
+warmup_bars = 300
+assumed_spread_bps = 1.5
+
+[exchange]
+name = "binance"
+base_url = "https://fapi.binance.com"
+ws_url = "wss://fstream.binance.com"
+api_key_env = "BINANCE_API_KEY"
+api_secret_env = "BINANCE_API_SECRET"
+testnet = false
+recv_window_ms = 5000
+feed = "ws"
+poll_interval_ms = 2000
+user_stream = true

@@ -1,0 +1,145 @@
+# ============================================================================
+# 回测配置：BTCUSDT 永续 1m 趋势回踩策略
+# 运行： python -m scalpx backtest --config config/backtest.toml
+# ============================================================================
+
+[run]
+name = "btc-trend-pullback"
+mode = "backtest"          # backtest | paper | live
+output_dir = "runs"
+log_level = "INFO"
+seed = 7
+
+[market]
+symbols = ["BTCUSDT"]
+interval = "1m"            # 信号粒度：1 分钟
+market_type = "futures"    # U 本位永续
+price_tick = 0.1           # BTCUSDT 最小价格变动
+qty_step = 0.001
+min_qty = 0.001
+min_notional = 5.0
+
+[data]
+source = "csv"             # csv | sqlite | binance_rest
+csv_dir = "data/raw"
+sqlite_path = "data/scalpx.db"
+start = "2024-01-01"
+end = "2024-01-31"
+warmup_bars = 300
+persist = true
+
+[strategy]
+name = "trend_pullback"
+
+[strategy.params]
+# 指标
+ema_fast = 21
+ema_slow = 55
+ema_trend = 144
+trend_slope_lookback = 20
+rsi_period = 14
+atr_period = 14
+vol_period = 20
+# 入场过滤
+pullback_lookback = 3
+pullback_atr_mult = 0.30
+rsi_cross = 50.0
+rsi_long_max = 70.0
+rsi_short_min = 30.0
+vol_mult = 1.10
+atr_min_pct = 0.0008
+atr_max_pct = 0.0060
+# 订单流 / 盘口（微观结构）
+flow_mode = "auto"          # auto | agg_trade | taker_proxy | off
+min_delta_ratio = 0.04      # 主动净买占比下限（等价 taker 占比 52%）
+min_cvd_slope = 0.0
+require_cvd_slope = true
+max_absorption = 0.85       # 买盘被吸收到 85% -> 放弃入场
+min_obi = 0.0               # 盘口失衡下限（0=不启用；有盘口数据时可设 0.05）
+min_stack_score = -1.0      # 堆叠失衡下限（-1=不启用；设 0.3 表示要求顺向有价格墙）
+require_flow = true
+flow_min_long = 0.52
+flow_min_short = 0.48
+# 出场
+stop_atr_mult = 2.00
+rr = 1.50
+be_at_r = 1.00
+be_offset_r = 0.10
+trail_at_r = 1.50
+trail_atr_mult = 1.20
+max_hold_bars = 30
+trend_flip_exit = true
+# 方向
+allow_long = true
+allow_short = true
+
+[risk]
+risk_per_trade = 0.0025      # 单笔风险 0.25% 权益
+max_positions = 2
+max_positions_per_symbol = 1
+max_leverage = 3.0
+max_notional_pct = 3.0
+max_daily_loss_pct = 0.025   # 日内 -2.5% 熔断
+max_daily_trades = 40
+consecutive_loss_cooldown = 3
+cooldown_minutes = 30
+consecutive_loss_halt = 5
+min_stop_pct = 0.0040
+max_stop_pct = 0.0080
+max_bars_held = 20
+max_spread_bps = 4.0
+symbol_cooldown_bars = 3
+correlated_risk_factor = 1.5
+
+[execution]
+entry_order_type = "limit_post_only"
+entry_timeout_ms = 3000
+entry_max_retries = 2
+entry_offset_bps = 0.0
+maker_fee = 0.0002
+taker_fee = 0.0004
+slippage_bps = 1.0
+latency_ms = 120
+use_exchange_stops = true
+stop_place_deadline_ms = 800
+reconcile_interval_s = 30
+max_order_reject_streak = 3
+tick_size_for_price = 0.1
+
+[microstructure]
+enabled = true
+use_agg_trades = true       # 订阅 aggTrade 计算真实 CVD
+use_order_book = true       # 订阅 depth20@100ms 计算 OBI
+depth_bps = 5.0             # 盘口带宽：只统计 ±5bps 内的挂单
+obi_levels = 20
+cvd_window = 20             # CVD 斜率窗口（bar 数）
+max_book_age_ms = 2000      # 盘口超过 2s 未更新视为不可用
+large_trade_usd = 50000.0
+stack_ratio = 3.0           # 档位失衡阈值（买/卖 >= 3 记为主导）
+stack_range = 3             # 连续多少档同向才算"价格墙"
+min_level_qty = 0.0         # 单档最小量（过滤冰山单噪声）
+max_bad_ratio = 0.5         # 滚动窗口异常比例上限
+gate_on_book_quality = true # 盘口不可信时熔断入场（BOOK_UNTRUSTED）
+persist_flow = true
+persist_book = false
+persist_book_interval_ms = 1000
+
+[backtest]
+initial_equity = 10000.0
+intrabar_path = "ohlc"
+pessimistic_intrabar = true
+funding_bps_per_8h = 0.0
+warmup_bars = 300
+assumed_spread_bps = 1.5
+
+[exchange]
+name = "binance"
+base_url = "https://fapi.binance.com"
+ws_url = "wss://fstream.binance.com"
+api_key_env = "BINANCE_API_KEY"
+api_secret_env = "BINANCE_API_SECRET"
+testnet = true
+recv_window_ms = 5000
+feed = "ws"
+poll_interval_ms = 2000
+user_stream = true

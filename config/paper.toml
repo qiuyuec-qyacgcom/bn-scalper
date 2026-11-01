@@ -1,0 +1,141 @@
+# ============================================================================
+# 纸上交易配置：真实行情 + 模拟撮合，不发送真实订单
+# 运行： python -m scalpx paper --config config/paper.toml
+# 前提： 能访问币安（或 testnet）公开行情接口；无需 API Key
+# ============================================================================
+
+[run]
+name = "btc-paper"
+mode = "paper"
+output_dir = "runs"
+log_level = "INFO"
+seed = 7
+
+[market]
+symbols = ["BTCUSDT"]
+interval = "1m"
+market_type = "futures"
+price_tick = 0.1
+qty_step = 0.001
+min_qty = 0.001
+min_notional = 5.0
+
+[data]
+source = "csv"
+csv_dir = "data/raw"
+sqlite_path = "data/paper.db"
+start = "2024-01-01"
+end = "2024-01-31"
+warmup_bars = 300
+persist = true
+
+[strategy]
+name = "trend_pullback"
+
+[strategy.params]
+ema_fast = 21
+ema_slow = 55
+ema_trend = 144
+trend_slope_lookback = 20
+rsi_period = 14
+atr_period = 14
+vol_period = 20
+pullback_lookback = 3
+pullback_atr_mult = 0.30
+rsi_cross = 50.0
+rsi_long_max = 70.0
+rsi_short_min = 30.0
+vol_mult = 1.10
+atr_min_pct = 0.0008
+atr_max_pct = 0.0060
+flow_mode = "auto"
+min_delta_ratio = 0.04
+min_cvd_slope = 0.0
+require_cvd_slope = true
+max_absorption = 0.85
+min_obi = 0.0
+min_stack_score = -1.0
+require_flow = true
+flow_min_long = 0.52
+flow_min_short = 0.48
+stop_atr_mult = 2.00
+rr = 1.50
+be_at_r = 1.00
+be_offset_r = 0.10
+trail_at_r = 1.50
+trail_atr_mult = 1.20
+max_hold_bars = 30
+trend_flip_exit = true
+allow_long = true
+allow_short = true
+
+[risk]
+risk_per_trade = 0.0025
+max_positions = 2
+max_positions_per_symbol = 1
+max_leverage = 3.0
+max_notional_pct = 3.0
+max_daily_loss_pct = 0.025
+max_daily_trades = 40
+consecutive_loss_cooldown = 3
+cooldown_minutes = 30
+consecutive_loss_halt = 5
+min_stop_pct = 0.0040
+max_stop_pct = 0.0080
+max_bars_held = 40
+max_spread_bps = 4.0
+symbol_cooldown_bars = 3
+correlated_risk_factor = 1.5
+
+[execution]
+entry_order_type = "limit_post_only"
+entry_timeout_ms = 3000
+entry_max_retries = 2
+entry_offset_bps = 0.5
+maker_fee = 0.0002
+taker_fee = 0.0004
+slippage_bps = 1.0
+latency_ms = 120
+use_exchange_stops = true
+stop_place_deadline_ms = 800
+reconcile_interval_s = 30
+max_order_reject_streak = 3
+tick_size_for_price = 0.1
+
+[microstructure]
+enabled = true
+use_agg_trades = true
+use_order_book = true
+depth_bps = 5.0
+obi_levels = 20
+cvd_window = 20
+max_book_age_ms = 2000
+large_trade_usd = 50000.0
+stack_ratio = 3.0
+stack_range = 3
+min_level_qty = 0.0
+max_bad_ratio = 0.5
+gate_on_book_quality = true
+persist_flow = true
+persist_book = true          # 纸上交易建议录制盘口，供日后回放
+persist_book_interval_ms = 1000
+
+[backtest]
+initial_equity = 10000.0
+intrabar_path = "ohlc"
+pessimistic_intrabar = true
+funding_bps_per_8h = 0.0
+warmup_bars = 300
+assumed_spread_bps = 1.5
+
+[exchange]
+name = "binance"
+base_url = "https://testnet.binancefuture.com"
+ws_url = "wss://fstream.binancefuture.com"
+api_key_env = "BINANCE_API_KEY"
+api_secret_env = "BINANCE_API_SECRET"
+testnet = true
+recv_window_ms = 5000
+feed = "ws"
+poll_interval_ms = 2000
+user_stream = false

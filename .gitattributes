@@ -1,0 +1,20 @@
+# 统一换行符：脚本必须 LF（否则在 Linux 上 shebang 会变成 /usr/bin/env bash\r）
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.toml  text eol=lf
+*.md    text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.service text eol=lf
+
+# 二进制/产物
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.db    binary
+*.pyc   binary

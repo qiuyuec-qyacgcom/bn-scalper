@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scalpx · 后台管理</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+
+<div class="login-wrap" id="loginView">
+  <form class="login-card" id="loginForm" autocomplete="off">
+    <h2>后台管理</h2>
+    <p class="sub">需要管理员权限</p>
+    <div class="field"><label for="loginUser">账号</label><input id="loginUser" type="text" required /></div>
+    <div class="field"><label for="loginPass">口令</label><input id="loginPass" type="password" required /></div>
+    <button class="btn primary" type="submit" style="width:100%;margin-top:6px">登录</button>
+    <div class="login-err" id="loginErr"></div>
+  </form>
+</div>
+
+<div class="shell" id="appView" style="display:none">
+  <aside class="sidebar">
+    <div class="brand"><span class="dot"></span><div>scalpx<br /><small>admin console</small></div></div>
+
+    <div class="nav-item active" data-view="overview"><span class="ico">▤</span>概览</div>
+    <div class="nav-item" data-view="users"><span class="ico">☺</span>用户与权限</div>
+    <div class="nav-item" data-view="config"><span class="ico">⚙</span>系统配置</div>
+    <div class="nav-item" data-view="data"><span class="ico">⇩</span>数据管理</div>
+    <div class="nav-item" data-view="risk"><span class="ico">⛔</span>风控开关</div>
+    <div class="nav-item" data-view="audit"><span class="ico">≡</span>审计日志</div>
+    <div class="nav-item" data-view="system"><span class="ico">▦</span>系统信息</div>
+
+    <div class="nav-sep"></div>
+    <a class="nav-item" href="/"><span class="ico">←</span>返回前台</a>
+
+    <div class="spacer"></div>
+    <div class="foot">仅 admin 可访问<br />所有操作均记入审计</div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div><h1 id="pageTitle">概览</h1><div class="sub" id="pageSub">系统状态与任务</div></div>
+      <div class="grow"></div>
+      <div class="user-chip"><span id="userName">—</span>
+        <span class="role-badge admin">管理员</span>
+        <a href="#" id="logoutBtn" style="color:var(--text-mute)">退出</a></div>
+    </header>
+
+    <div class="content">
+
+      <!-- 概览 -->
+      <section class="view active" id="view-overview">
+        <div class="grid g4" style="margin-bottom:14px">
+          <div class="card"><div class="kpi"><span class="label">用户数</span><span class="value" id="ovUsers">—</span><span class="hint">含管理员</span></div></div>
+          <div class="card"><div class="kpi"><span class="label">历史运行</span><span class="value" id="ovRuns">—</span><span class="hint">回测批次</span></div></div>
+          <div class="card"><div class="kpi"><span class="label">交易库</span><span class="value" id="ovDbSize">—</span><span class="hint" id="ovDbPath">—</span></div></div>
+          <div class="card"><div class="kpi"><span class="label">服务运行</span><span class="value" id="ovUptime">—</span><span class="hint" id="ovVersion">—</span></div></div>
+        </div>
+        <div class="grid g2">
+          <div class="card pad0"><div class="card-head"><h3>最近任务</h3></div>
+            <div class="table-wrap"><table id="jobTable"></table></div></div>
+          <div class="card pad0"><div class="card-head"><h3>数据表规模</h3></div>
+            <div class="table-wrap"><table id="tableStats"></table></div></div>
+        </div>
+      </section>
+
+      <!-- 用户 -->
+      <section class="view" id="view-users">
+        <div class="toolbar">
+          <div class="hint-box" style="margin:0">角色决定接口权限：<b>user</b> 只能看自己的运行；<b>admin</b> 拥有全部管理能力。删除/禁用会立即使其会话失效。</div>
+          <div class="grow"></div>
+          <button class="btn primary" id="newUserBtn">新建用户</button>
+        </div>
+        <div class="card pad0"><div class="table-wrap"><table id="userTable"></table></div></div>
+      </section>
+
+      <!-- 配置 -->
+      <section class="view" id="view-config">
+        <div class="toolbar">
+          <div class="field" style="width:220px"><label>配置档案</label><select id="cfgProfile"></select></div>
+          <div class="grow"></div>
+          <button class="btn" id="cfgReload">重新加载</button>
+          <button class="btn primary" id="cfgSave">保存并校验</button>
+        </div>
+        <div class="hint-box">保存前会用正式加载器 <b>load_config()</b> 校验；非法配置会被拒绝并保留原文件，成功时自动生成 <b>.bak.时间戳</b> 备份。</div>
+        <div id="cfgList"><div class="empty">加载中…</div></div>
+      </section>
+
+      <!-- 数据 -->
+      <section class="view" id="view-data">
+        <div class="grid g2" style="margin-bottom:14px">
+          <div class="card">
+            <div class="card-head"><h3>下载历史数据</h3></div>
+            <div class="form-grid">
+              <div class="field"><label>类型</label>
+                <select id="dlKind"><option value="kline">K 线（回测用）</option><option value="flow">订单流（CVD 用）</option></select></div>
+              <div class="field"><label>交易对</label><input id="dlSymbol" type="text" value="BTCUSDT" /></div>
+              <div class="field"><label>周期</label><input id="dlInterval" type="text" value="1m" /></div>
+              <div class="field"><label>开始日期</label><input id="dlStart" type="date" /></div>
+              <div class="field"><label>结束日期</label><input id="dlEnd" type="date" /></div>
+              <div class="field" style="justify-content:flex-end"><button class="btn primary" id="dlBtn">开始下载</button></div>
+            </div>
+            <div class="hint-box" style="margin-top:12px">订单流会在下载过程中直接聚合成 per-bar 数据，不落地原始逐笔（磁盘占用低 3 个数量级）。</div>
+          </div>
+          <div class="card pad0">
+            <div class="card-head"><h3>任务队列</h3><div class="grow"></div><button class="btn sm ghost" id="jobRefresh">刷新</button></div>
+            <div class="table-wrap"><table id="jobTable2"></table></div>
+          </div>
+        </div>
+        <div class="card pad0">
+          <div class="card-head"><h3>运行记录（可删除）</h3></div>
+          <div class="table-wrap"><table id="runAdminTable"></table></div>
+        </div>
+      </section>
+
+      <!-- 风控 -->
+      <section class="view" id="view-risk">
+        <div class="grid g2">
+          <div class="card">
+            <div class="card-head"><h3>紧急停机（Kill Switch）</h3></div>
+            <div id="riskState" class="kpi" style="margin-bottom:16px">
+              <span class="label">当前状态</span><span class="value" id="riskValue">—</span>
+            </div>
+            <div class="field" style="margin-bottom:12px"><label>原因（记录到审计与 KILL 文件）</label>
+              <input id="riskReason" type="text" placeholder="例如：盘口异常 / 人工复核" /></div>
+            <div style="display:flex;gap:10px">
+              <button class="btn danger" id="haltBtn">立即停机</button>
+              <button class="btn" id="resumeBtn">恢复交易</button>
+            </div>
+            <div class="hint-box" style="margin-top:14px">
+              停机通过写入 <b>data/KILL</b> 文件生效：实盘引擎每 5 秒轮询该文件，
+              检测到后撤单、平仓并退出。恢复会删除该文件。
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>接线说明</h3></div>
+            <div class="kv">
+              <div class="k">KILL 文件路径</div><div class="v" id="riskKillPath">—</div>
+              <div class="k">生效延迟</div><div class="v">≤ 5 秒（housekeeping 轮询周期）</div>
+              <div class="k">失败兜底</div><div class="v">交易所侧 STOP_MARKET 保护单仍在</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 审计 -->
+      <section class="view" id="view-audit">
+        <div class="toolbar"><div class="hint-box" style="margin:0">记录登录、用户变更、配置修改、风控操作、数据下载与运行删除。</div>
+          <div class="grow"></div><button class="btn" id="auditRefresh">刷新</button></div>
+        <div class="card pad0"><div class="table-wrap"><table id="auditTable"></table></div></div>
+      </section>
+
+      <!-- 系统 -->
+      <section class="view" id="view-system">
+        <div class="grid g2">
+          <div class="card"><div class="card-head"><h3>服务</h3></div><div class="kv" id="sysService"></div></div>
+          <div class="card"><div class="card-head"><h3>存储</h3></div><div class="kv" id="sysStorage"></div></div>
+        </div>
+        <div class="card" style="margin-top:14px"><div class="card-head"><h3>微观结构</h3></div><div class="kv" id="sysMicro"></div></div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<div class="modal-host" id="modalHost"><div class="modal" id="modalBox"></div></div>
+<div class="toast-host" id="toastHost"></div>
+
+<script src="/static/app.js"></script>
+<script src="/static/admin.js"></script>
+</body>
+</html>

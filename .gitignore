@@ -1,0 +1,24 @@
+# 数据与运行产物（体积大、含隐私，不入库）
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/raw/*.csv
+runs/
+logs/
+
+# kill switch（运行时文件）
+data/KILL
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 环境变量（含 API 密钥）
+.env
+.env.*
