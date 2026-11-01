@@ -290,7 +290,7 @@ class Handler(BaseHTTPRequestHandler):
             response = self.app.api.dispatch(req)
             self._json(response.status, response.payload)
         except ApiError as exc:
-            self._json(exc.status, fail(exc.code, exc.message))
+            self._json(exc.status, fail(exc.code, exc.message, getattr(exc, "details", None)))
         except BrokenPipeError:  # 客户端提前断开
             return
         except Exception as exc:  # noqa: BLE001 - 兜底，避免线程崩溃后连接悬挂

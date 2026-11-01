@@ -46,6 +46,7 @@ async function adminBoot() {
 const ADMIN_TITLES = {
   overview: ['概览', '系统状态与任务'],
   users: ['用户与权限', '角色、状态与会话失效'],
+  instruments: ['标的库', '跨资产类型的主数据：股票 / 基金 / 债券 / 期货 / 外汇 / 加密'],
   config: ['系统配置', '在线编辑并按正式加载器校验'],
   data: ['数据管理', '历史行情下载与运行清理'],
   risk: ['风控开关', '紧急停机与恢复'],
@@ -63,6 +64,7 @@ function switchAdminView(name) {
 
   if (name === 'overview') adminLoadOverview();
   else if (name === 'users') adminLoadUsers();
+  else if (name === 'instruments') adminLoadInstruments();
   else if (name === 'config') adminLoadConfig();
   else if (name === 'data') { adminLoadJobs(); adminLoadRuns(); }
   else if (name === 'risk') adminLoadRisk();
@@ -417,6 +419,313 @@ async function adminLoadSystem(render = false) {
 }
 
 /* ------------------------------------------------------------------ */
+/* 标的库                                                              */
+/* ------------------------------------------------------------------ */
+const InstState = { types: [], items: [], editing: null, filterReady: false };
+const TYPE_LABELS = {};
+
+async function adminLoadInstruments() {
+  const params = new URLSearchParams();
+  const q = $('#instQuery').value.trim();
+  const type = $('#instTypeFilter').value;
+  if (q) params.set('q', q);
+  if (type) params.set('type', type);
+  const qs = params.toString();
+
+  const d = await api('/api/admin/instruments' + (qs ? '?' + qs : ''));
+  InstState.types = d.types || [];
+  InstState.items = d.items || [];
+
+  if (!InstState.filterReady) {
+    const sel = $('#instTypeFilter');
+    d.types.forEach(t => {
+      TYPE_LABELS[t.value] = t.label;
+      const opt = document.createElement('option');
+      opt.value = t.value;
+      opt.textContent = t.label;
+      sel.appendChild(opt);
+    });
+    InstState.filterReady = true;
+  }
+  renderInstrumentTable();
+}
+
+function renderInstrumentTable() {
+  const filtering = !!($('#instQuery').value.trim() || $('#instTypeFilter').value);
+  const rows = InstState.items;
+
+  renderTable($('#instrumentTable'), [
+    {
+      title: '排序', width: '80px',
+      render: (r) => {
+        if (filtering) return '<span class="dim" style="font-size:11px">—</span>';
+        const i = InstState.items.indexOf(r);
+        return `<button class="btn sm ghost" data-move="-1" data-i="${i}" ${i === 0 ? 'disabled' : ''}>↑</button>` +
+               `<button class="btn sm ghost" data-move="1" data-i="${i}" ${i === InstState.items.length - 1 ? 'disabled' : ''}>↓</button>`;
+      },
+    },
+    { title: '代码', render: r => `<span class="mono">${r.code}</span>` },
+    { title: '名称', key: 'name' },
+    { title: '类型', render: r => `<span class="badge">${TYPE_LABELS[r.asset_type] || r.asset_type}</span>` },
+    { title: '市场', key: 'market' },
+    { title: '计价币', key: 'currency' },
+    {
+      title: 'tick / step', align: 'right',
+      render: r => `<span class="mono" style="font-size:11px">${r.price_tick} / ${r.qty_step}</span>`,
+    },
+    {
+      title: '状态',
+      render: r => `<span class="badge ${r.is_active ? 'ok' : 'bad'}">${r.is_active ? '启用' : '停用'}</span>`,
+    },
+    {
+      title: '操作', align: 'right',
+      render: r => `<button class="btn sm ghost" data-edit="${r.id}">编辑</button>` +
+                   `<button class="btn sm danger" data-del="${r.id}" data-code="${r.code}">删除</button>`,
+    },
+  ], rows, '还没有标的，点右上角「新增标的」或「批量导入」');
+
+  $('#instSummary').textContent = filtering
+    ? `筛选出 ${rows.length} 条（筛选状态下不显示排序按钮）`
+    : `共 ${rows.length} 条标的`;
+
+  $$('[data-move]').forEach(btn => {
+    btn.onclick = () => instMove(Number(btn.dataset.i), Number(btn.dataset.move));
+  });
+  $$('[data-edit]').forEach(btn => {
+    btn.onclick = () => {
+      const item = InstState.items.find(i => String(i.id) === btn.dataset.edit);
+      if (item) instModal(item);
+    };
+  });
+  $$('[data-del]').forEach(btn => {
+    btn.onclick = async () => {
+      if (!confirm(`删除标的 ${btn.dataset.code}？引用它的回测选择会失效。`)) return;
+      try {
+        await api('/api/admin/instruments/' + btn.dataset.del, { method: 'DELETE' });
+        toast('已删除', 'ok');
+        adminLoadInstruments();
+      } catch (err) { toast(err.message, 'err'); }
+    };
+  });
+}
+
+async function instMove(index, delta) {
+  const items = InstState.items.slice();
+  const target = index + delta;
+  if (target < 0 || target >= items.length) return;
+  [items[index], items[target]] = [items[target], items[index]];
+  try {
+    await api('/api/admin/instruments/order', {
+      method: 'PUT',
+      body: { ids: items.map(i => i.id) },
+    });
+    InstState.items = items;
+    renderInstrumentTable();
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+function instFieldHtml(cur) {
+  return `
+    <div class="hint-box" id="instDupHint" style="display:none"></div>
+    <div class="form-grid">
+      <div class="field"><label>资产类型 *</label><select id="fType"></select></div>
+      <div class="field"><label>市场 *</label><select id="fMarket"></select></div>
+      <div class="field"><label>代码 *</label><input id="fCode" type="text" value="${cur.code || ''}" placeholder="如 600519 / BTCUSDT / RB2410" />
+        <span class="dim" style="font-size:11px" id="fCodeHint"></span></div>
+      <div class="field"><label>名称 *</label><input id="fName" type="text" value="${cur.name || ''}" placeholder="如 贵州茅台" /></div>
+      <div class="field"><label>计价币</label><input id="fCurrency" type="text" value="${cur.currency || ''}" placeholder="CNY / USD / USDT" /></div>
+      <div class="field"><label>状态</label><select id="fActive">
+        <option value="true" ${cur.is_active !== false ? 'selected' : ''}>启用</option>
+        <option value="false" ${cur.is_active === false ? 'selected' : ''}>停用</option></select></div>
+      <div class="field"><label>price_tick</label><input id="fTick" type="number" step="any" value="${cur.price_tick ?? 0.01}" /></div>
+      <div class="field"><label>qty_step</label><input id="fStep" type="number" step="any" value="${cur.qty_step ?? 1}" /></div>
+      <div class="field"><label>min_notional</label><input id="fNotional" type="number" step="any" value="${cur.min_notional ?? 0}" /></div>
+      <div class="field"><label>lot_size</label><input id="fLot" type="number" step="any" value="${cur.lot_size ?? 0}" /></div>
+    </div>
+    <div class="field" style="margin-top:10px"><label>扩展属性（JSON，可选）</label>
+      <textarea id="fMeta" rows="2" placeholder='{"exchange":"BINANCE","sector":"白酒"}'>${Object.keys(cur.meta || {}).length ? JSON.stringify(cur.meta) : ''}</textarea></div>
+    <div id="instIssues" style="margin-top:10px;font-size:12px"></div>`;
+}
+
+function instReadForm() {
+  const type = $('#fType').value;
+  const payload = {
+    asset_type: type,
+    market: $('#fMarket').value,
+    code: $('#fCode').value.trim(),
+    name: $('#fName').value.trim(),
+    currency: $('#fCurrency').value.trim(),
+    price_tick: $('#fTick').value,
+    qty_step: $('#fStep').value,
+    min_notional: $('#fNotional').value,
+    lot_size: $('#fLot').value,
+    is_active: $('#fActive').value === 'true',
+  };
+  const meta = $('#fMeta').value.trim();
+  if (meta) payload.meta = meta;
+  return payload;
+}
+
+function instSyncMarkets(keep) {
+  const type = $('#fType').value;
+  const spec = InstState.types.find(t => t.value === type);
+  const sel = $('#fMarket');
+  const prev = keep || sel.value;
+  sel.innerHTML = spec.markets
+    .map(m => `<option value="${m.value}" ${m.value === prev ? 'selected' : ''}>${m.label}（${m.value}）</option>`)
+    .join('');
+  if (!sel.value && spec.markets.length) sel.value = spec.default_market;
+  if (!keep && !$('#fCurrency').value.trim()) $('#fCurrency').value = spec.default_currency;
+  const market = spec.markets.find(m => m.value === sel.value) || spec.markets[0];
+  $('#fCodeHint').textContent = market ? market.hint : '';
+}
+
+let instValidateTimer = null;
+
+function instScheduleValidate() {
+  clearTimeout(instValidateTimer);
+  instValidateTimer = setTimeout(instValidate, 350);
+}
+
+async function instValidate() {
+  const payload = instReadForm();
+  if (!payload.code && !payload.name) return;
+  try {
+    const r = await api('/api/admin/instruments/validate', { method: 'POST', body: payload });
+    const issues = r.issues || [];
+    $('#instIssues').innerHTML = issues.length
+      ? issues.map(i => `<div class="down">• ${i.field}：${i.message}</div>`).join('')
+      : '<div class="up">• 校验通过</div>';
+
+    const hint = $('#instDupHint');
+    if (r.duplicate && r.existing) {
+      hint.style.display = 'block';
+      hint.innerHTML = `该标的已存在：<b>${r.existing.code}</b> ${r.existing.name}（ID ${r.existing.id}），保存会被拒绝。`;
+    } else {
+      hint.style.display = 'none';
+    }
+    return r.valid && !r.duplicate;
+  } catch (err) {
+    $('#instIssues').innerHTML = `<div class="down">• ${err.message}</div>`;
+    return false;
+  }
+}
+
+function instModal(item) {
+  InstState.editing = item || null;
+  const isEdit = !!item;
+  const first = InstState.types[0];
+  const cur = item || {
+    asset_type: first.value,
+    market: first.default_market,
+    currency: first.default_currency,
+    price_tick: 0.01, qty_step: 1, min_notional: 0, lot_size: 0,
+    is_active: true, meta: {},
+  };
+
+  openModal(
+    `<h3>${isEdit ? '编辑标的' : '新增标的'}</h3>${instFieldHtml(cur)}
+     <div class="actions">
+       <button class="btn" id="instCancel">取消</button>
+       <button class="btn primary" id="instSave">${isEdit ? '保存' : '添加'}</button>
+     </div>`,
+    () => {
+      const sel = $('#fType');
+      sel.innerHTML = InstState.types.map(t => `<option value="${t.value}">${t.label}</option>`).join('');
+      sel.value = cur.asset_type;
+      instSyncMarkets(cur.market);
+      if (!isEdit) $('#fCurrency').value = cur.currency;
+
+      sel.onchange = () => { instSyncMarkets(); instScheduleValidate(); };
+      $('#fMarket').onchange = () => {
+        const spec = InstState.types.find(t => t.value === $('#fType').value);
+        const m = spec.markets.find(x => x.value === $('#fMarket').value);
+        if (m) $('#fCodeHint').textContent = m.hint;
+        instScheduleValidate();
+      };
+      ['#fCode', '#fName', '#fCurrency', '#fTick', '#fStep', '#fNotional', '#fLot', '#fMeta'].forEach(s => {
+        const el = $(s);
+        if (el) el.oninput = instScheduleValidate;
+      });
+
+      $('#instCancel').onclick = closeModal;
+      $('#instSave').onclick = async () => {
+        const payload = instReadForm();
+        const ok = await instValidate();
+        if (!ok) { toast('请先修正校验问题', 'err'); return; }
+        try {
+          if (isEdit) {
+            await api('/api/admin/instruments/' + item.id, { method: 'PATCH', body: payload });
+            toast('已保存', 'ok');
+          } else {
+            await api('/api/admin/instruments', { method: 'POST', body: payload });
+            toast('已添加', 'ok');
+          }
+          closeModal();
+          adminLoadInstruments();
+        } catch (err) {
+          const details = err.details || [];
+          if (details.length) {
+            $('#instIssues').innerHTML = details.map(d => `<div class="down">• ${d.field}：${d.message}</div>`).join('');
+          }
+          toast(err.message, 'err');
+        }
+      };
+
+      setTimeout(instValidate, 200);
+    }
+  );
+}
+
+function instBatchModal() {
+  const sample = [
+    'BTCUSDT,比特币,crypto',
+    '600519,贵州茅台,stock,SH',
+    '510300,沪深300ETF,fund,CN',
+    'RB2410,螺纹钢,futures,SHFE',
+    'EURUSD,欧元美元,forex',
+  ].join('\n');
+  openModal(
+    `<h3>批量导入</h3>
+     <div class="hint-box">
+       每行一条，列顺序：<b>代码,名称,类型[,市场][,计价币][,price_tick][,qty_step]</b><br />
+       支持逗号 / 制表符 / 空格分隔，以 <span class="mono">#</span> 开头为注释。重复项会自动跳过并计数。
+     </div>
+     <textarea id="batchText" rows="9" placeholder="${sample}"></textarea>
+     <div id="batchResult" style="margin-top:12px;font-size:12px;max-height:200px;overflow:auto"></div>
+     <div class="actions">
+       <button class="btn" id="batchCancel">关闭</button>
+       <button class="btn primary" id="batchOk">开始导入</button>
+     </div>`,
+    () => {
+      $('#batchText').value = sample;
+      $('#batchCancel').onclick = closeModal;
+      $('#batchOk').onclick = async () => {
+        const text = $('#batchText').value;
+        if (!text.trim()) { toast('请填写内容', 'err'); return; }
+        try {
+          const r = await api('/api/admin/instruments/batch', { method: 'POST', body: { text } });
+          const STATUS = {
+            created: '<span class="badge ok">新增</span>',
+            duplicate: '<span class="badge warn">跳过·重复</span>',
+            invalid: '<span class="badge bad">无效</span>',
+          };
+          $('#batchResult').innerHTML =
+            `<div style="margin-bottom:8px">共 ${r.total} 行：新增 <b class="up">${r.created}</b>，
+              去重 <b class="warn">${r.duplicated}</b>，无效 <b class="down">${r.invalid}</b></div>` +
+            r.items.map(it => `<div style="padding:3px 0;border-top:1px solid #1b2534">
+              第 ${it.line} 行 <span class="mono">${it.code || '-'}</span> ${STATUS[it.status] || it.status}
+              <span class="dim">${it.message || (it.issues ? it.issues.map(i => i.message).join('；') : '')}</span>
+            </div>`).join('');
+          toast(`导入完成：新增 ${r.created} 条`, 'ok');
+          adminLoadInstruments();
+        } catch (err) { toast(err.message, 'err'); }
+      };
+    }
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* 初始化                                                              */
 /* ------------------------------------------------------------------ */
 window.initAdmin = function initAdmin() {
@@ -430,6 +739,15 @@ window.initAdmin = function initAdmin() {
   $$('.nav-item[data-view]').forEach(el => el.addEventListener('click', () => switchAdminView(el.dataset.view)));
 
   $('#newUserBtn').onclick = adminNewUser;
+
+  // 标的库
+  $('#instNewBtn').onclick = () => instModal(null);
+  $('#instBatchBtn').onclick = instBatchModal;
+  $('#instRefresh').onclick = adminLoadInstruments;
+  $('#instTypeFilter').onchange = adminLoadInstruments;
+  $('#instQuery').addEventListener('keydown', e => {
+    if (e.key === 'Enter') adminLoadInstruments();
+  });
   $('#cfgProfile').onchange = e => adminLoadConfig(e.target.value);
   $('#cfgReload').onclick = () => adminLoadConfig(AdminState.cfgProfile);
   $('#cfgSave').onclick = adminSaveConfig;

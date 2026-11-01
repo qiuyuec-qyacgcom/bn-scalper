@@ -52,6 +52,7 @@ scalpx/web/
 |---|---|---|
 | 概览 | 用户数/运行数/库大小/运行时长、最近任务、表规模 | — |
 | 用户与权限 | 列表、新建、改角色、启用/禁用、重置口令、删除 | 不能删除自己；至少保留一个启用管理员；禁用/改密立即失效旧会话 |
+| 标的库 | 跨资产类型主数据：新增/编辑/删除、上移下移排序、批量导入、实时校验 | 判重键 `类型+市场+代码`；批量导入逐行回报结果；停用标的不参与回测 |
 | 系统配置 | 按 TOML 分组的表单，布尔/数字/数组自动识别类型 | 保存前用 `load_config()` 校验；成功自动备份；失败不落盘 |
 | 数据管理 | 下载 K 线 / 订单流，查看任务队列，删除运行 | 下载走后台任务，不阻塞请求 |
 | 风控开关 | 停机/恢复，写 `data/KILL` | 实盘引擎 5 秒内响应 |
@@ -167,6 +168,64 @@ scalpx/web/
 | POST | `/api/admin/risk` | `{action: halt\|resume, reason?}` |
 | DELETE | `/api/admin/runs/{run_id}` | 删除运行及其明细 |
 
+#### 标的库
+
+| 方法 | 路径 | 权限 | 说明 |
+|---|---|---|---|
+| GET | `/api/instruments` | 任意 | 轻量列表（前台筛选/补全用），支持 `type` `q` `active_only` |
+| GET | `/api/admin/instruments` | admin | 完整列表（含时间戳、扩展属性） |
+| POST | `/api/admin/instruments` | admin | 新增；重复返回 `409 DUPLICATE` |
+| POST | `/api/admin/instruments/validate` | admin | 实时校验，返回 `{valid, issues[], duplicate, existing}` |
+| POST | `/api/admin/instruments/batch` | admin | 批量导入，`{rows:[...]}` 或 `{text:"..."}` |
+| PATCH | `/api/admin/instruments/{id}` | admin | 编辑（整体合并后重新校验） |
+| DELETE | `/api/admin/instruments/{id}` | admin | 删除 |
+| PUT | `/api/admin/instruments/order` | admin | `{ids:[...]}` 按序重排 |
+
+```json
+// POST /api/admin/instruments/batch   （text 形式）
+{"ok":true,"data":{
+  "total":4,"created":2,"duplicated":1,"invalid":1,
+  "items":[
+    {"line":1,"code":"600519","name":"贵州茅台","status":"created","id":12},
+    {"line":2,"code":"RB2410","name":"螺纹钢","status":"created","id":13},
+    {"line":3,"code":"BTCUSDT","status":"duplicate","existing_id":1,"message":"已存在于标的库"},
+    {"line":4,"code":"BAD","status":"invalid","issues":[{"field":"code","message":"代码格式不符：6 位数字，如 600519"}]}
+  ]}}
+
+// POST /api/admin/instruments  重复时
+{"ok":false,"error":{"code":"DUPLICATE","message":"标的已存在：BTCUSDT 比特币（crypto/BINANCE）",
+ "details":{"existing":{"id":1,"code":"BTCUSDT"}}}}
+```
+
+**资产类型与代码规则**（`scalpx/web/instruments.py::ASSET_TYPES`，新增市场只需加一行）
+
+| 类型 | 市场 | 代码规则 | 示例 |
+|---|---|---|---|
+| `crypto` | BINANCE / OKX / BYBIT / COINBASE | `^[A-Z0-9]{5,24}$` | `BTCUSDT` |
+| `stock` | SH / SZ / BJ | `^\d{6}$` | `600519` |
+| | HK | `^\d{5}$` | `00700` |
+| | US / JP | `^[A-Z]{1,5}(\.[A-Z]{1,2})?$` / `^\d{4}$` | `AAPL` `BRK.A` |
+| `fund` | CN / HK / US | 6 位数字 / 5 位数字 / 字母 | `510300` |
+| `bond` | CN / US | 6 位数字 / `^[A-Z0-9]{5,12}$` | `019547` |
+| `futures` | SHFE / DCE / CZCE / CFFEX / INE | `^[A-Z]{1,2}\d{3,4}$` | `RB2410` `IF2409` |
+| | CME / ICE | `^[A-Z]{1,3}[FGHJKMNQUVXZ]\d{1,2}$` | `ESZ4` |
+| `forex` | FX | `^[A-Z]{6}$` | `EURUSD`（`EUR/USD` 自动归一） |
+
+**规范化与判重**
+
+- 输入先规范化：去空格/`/`/`-`/`_`、转大写、保留数字前导零 → `btc/usdt` 与 `BTCUSDT` 视为同一标的。
+- 判重键 `asset_type:market:code`：`000001` 在 `SZ` 与 `SH` 是两个合法标的，同市场下才冲突。
+- 批量导入内建两级去重：**批内重复**与**库内已存在**都计入 `duplicated` 并跳过，不报错中断。
+
+**被后续功能引用**
+
+- 前台「交易明细」的标的输入框接入 `datalist` 补全；
+- 「运行新回测」可多选标的，`POST /api/backtest` 携带 `symbols`；
+- 回测前做两道校验：标的必须**已注册且启用**（否则 `404 INSTRUMENT_NOT_FOUND`），
+  且本地必须有对应 `{symbol}_{interval}.csv`（否则 `400 DATA_MISSING`）；
+- 所选标的的 `price_tick` / `qty_step` 必须一致（引擎一次运行只支持一套精度，否则 `400 TICK_MISMATCH`），
+  一致时用标的库的值覆盖配置，避免按错误精度取整。
+
 ```json
 // POST /api/admin/config   非法配置示例
 {"ok":false,"error":{"code":"CONFIG_INVALID",
@@ -197,6 +256,7 @@ scalpx/web/
 | `settings` | `key, value(JSON), updated_ts` | 如 `user_backtest_daily` |
 | `run_owner` | `run_id, owner_id` | 运行归属（交易库里没有归属字段，故单独建表） |
 | `quota` | `uid, day, used` | 每日回测配额 |
+| `instruments` | `symbol_key(唯一), code, name, asset_type, market, currency, price_tick, qty_step, min_notional, lot_size, is_active, sort_order, meta_json` | 跨资产类型标的库；`symbol_key = 类型:市场:代码` |
 
 ### 4.2 交易库（只读）
 

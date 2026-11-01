@@ -33,6 +33,12 @@ from .auth import (
     issue_token,
     verify_password,
 )
+from .instruments import (
+    canonical_key,
+    parse_batch_text,
+    type_options,
+    validate_instrument,
+)
 from .repo import TradingRepo, WebRepo
 from .tomlio import dumps as toml_dumps
 
@@ -42,11 +48,12 @@ from .tomlio import dumps as toml_dumps
 
 
 class ApiError(Exception):
-    def __init__(self, code: str, message: str, status: int = 400) -> None:
+    def __init__(self, code: str, message: str, status: int = 400, details: Any = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        self.details = details
 
 
 @dataclass(slots=True)
@@ -95,8 +102,11 @@ def ok(data: Any, **meta: Any) -> dict[str, Any]:
     return payload
 
 
-def fail(code: str, message: str) -> dict[str, Any]:
-    return {"ok": False, "error": {"code": code, "message": message}}
+def fail(code: str, message: str, details: Any = None) -> dict[str, Any]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if details is not None:
+        error["details"] = details
+    return {"ok": False, "error": error}
 
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +126,15 @@ ROUTES: list[Route] = [
     ("GET", re.compile(r"^/api/signals$"), "signals", (ROLE_ADMIN, ROLE_USER)),
     ("GET", re.compile(r"^/api/micro$"), "micro", (ROLE_ADMIN, ROLE_USER)),
     ("POST", re.compile(r"^/api/backtest$"), "run_backtest", (ROLE_ADMIN, ROLE_USER)),
+    # --- 标的库 ---
+    ("GET", re.compile(r"^/api/instruments$"), "instruments", (ROLE_ADMIN, ROLE_USER)),
+    ("GET", re.compile(r"^/api/admin/instruments$"), "instruments_admin", (ROLE_ADMIN,)),
+    ("POST", re.compile(r"^/api/admin/instruments$"), "instruments_create", (ROLE_ADMIN,)),
+    ("POST", re.compile(r"^/api/admin/instruments/validate$"), "instruments_validate", (ROLE_ADMIN,)),
+    ("POST", re.compile(r"^/api/admin/instruments/batch$"), "instruments_batch", (ROLE_ADMIN,)),
+    ("PUT", re.compile(r"^/api/admin/instruments/order$"), "instruments_reorder", (ROLE_ADMIN,)),
+    ("PATCH", re.compile(r"^/api/admin/instruments/(?P<iid>\d+)$"), "instruments_update", (ROLE_ADMIN,)),
+    ("DELETE", re.compile(r"^/api/admin/instruments/(?P<iid>\d+)$"), "instruments_delete", (ROLE_ADMIN,)),
     # --- 后台 ---
     ("GET", re.compile(r"^/api/admin/users$"), "users_list", (ROLE_ADMIN,)),
     ("POST", re.compile(r"^/api/admin/users$"), "users_create", (ROLE_ADMIN,)),
@@ -446,20 +465,301 @@ class Api:
         if not isinstance(overrides, dict):
             raise ApiError("BAD_REQUEST", "params 必须是对象")
 
+        selection = self._resolve_symbols(req, cfg_path)
+
         owner = p.uid
         username = p.username
 
         def _job() -> dict:
-            return self._execute_backtest(cfg_path, overrides, owner)
+            return self._execute_backtest(cfg_path, overrides, owner, selection)
 
         job_id = self._submit_job(f"backtest:{profile}", _job)
         self.web.audit(
             uid=p.uid, username=username, action="backtest_submit",
-            target=profile, detail=json.dumps(overrides, ensure_ascii=False), ip=req.ip,
+            target=profile,
+            detail=json.dumps(
+                {"params": overrides, "symbols": [s["code"] for s in selection] if selection else None},
+                ensure_ascii=False,
+            ),
+            ip=req.ip,
         )
-        return {"job_id": job_id, "profile": profile, "used_today": used, "quota": limit}
+        return {
+            "job_id": job_id,
+            "profile": profile,
+            "used_today": used,
+            "quota": limit,
+            "symbols": [s["code"] for s in selection] if selection else None,
+        }
 
-    def _execute_backtest(self, cfg_path: Path, overrides: dict[str, Any], owner: int) -> dict:
+    # ------------------------------------------------------------------ #
+    # 标的库
+    # ------------------------------------------------------------------ #
+    def _resolve_symbols(self, req: Request, cfg_path: Path) -> list[dict] | None:
+        """把前端选择的标的代码解析成标的记录，并校验"可回测性"。
+
+        两道校验缺一不可：
+        1. 必须在标的库里注册且启用；
+        2. 本地必须有对应的行情文件——注册了不等于有数据，否则回测会静默跑出 0 笔。
+        """
+        raw = req.body.get("symbols")
+        if raw in (None, [], ""):
+            return None
+        if not isinstance(raw, list) or not all(isinstance(s, str) and s.strip() for s in raw):
+            raise ApiError("BAD_REQUEST", "symbols 必须是字符串数组")
+        codes = [s.strip().upper() for s in raw]
+        if len(codes) > 10:
+            raise ApiError("BAD_REQUEST", "单次最多选择 10 个标的")
+        if len(set(codes)) != len(codes):
+            raise ApiError("BAD_REQUEST", "symbols 存在重复项")
+
+        registry = {i["code"]: i for i in self.web.list_instruments(active_only=True)}
+        missing = [c for c in codes if c not in registry]
+        if missing:
+            raise ApiError(
+                "INSTRUMENT_NOT_FOUND",
+                f"未注册或已停用：{', '.join(missing)}。请先在「标的库」中登记。",
+                404,
+                details={"missing": missing, "registered": sorted(registry)},
+            )
+
+        items = [registry[c] for c in codes]
+        ticks = {round(float(i["price_tick"]), 12) for i in items}
+        steps = {round(float(i["qty_step"]), 12) for i in items}
+        if len(ticks) > 1 or len(steps) > 1:
+            raise ApiError(
+                "TICK_MISMATCH",
+                "所选标的的 price_tick / qty_step 不一致；引擎一次运行只支持同一套精度。"
+                "请分批回测，或统一这两项属性。",
+                400,
+            )
+
+        from ..config import load_config
+
+        try:
+            cfg = load_config(cfg_path)
+        except Exception as exc:  # noqa: BLE001 - 配置错误要原样回给前端
+            raise ApiError("CONFIG_INVALID", f"读取配置失败：{exc}", 500) from exc
+
+        csv_dir = Path(cfg.data.csv_dir)
+        no_data = [c for c in codes if not (csv_dir / f"{c}_{cfg.market.interval}.csv").exists()]
+        if no_data:
+            raise ApiError(
+                "DATA_MISSING",
+                f"本地缺少行情数据：{', '.join(no_data)}（{cfg.market.interval}）。请先在「数据管理」中下载。",
+                400,
+                details={"missing": no_data, "csv_dir": str(csv_dir)},
+            )
+        return items
+
+    def h_instruments(self, req: Request) -> dict:
+        items = self.web.list_instruments(
+            asset_type=req.q("type"), query=req.q("q"), active_only=req.q("active_only") == "1"
+        )
+        return {
+            "items": [
+                {
+                    "id": i["id"],
+                    "code": i["code"],
+                    "name": i["name"],
+                    "asset_type": i["asset_type"],
+                    "market": i["market"],
+                    "currency": i["currency"],
+                    "is_active": i["is_active"],
+                }
+                for i in items
+            ],
+            "types": type_options(),
+            "total": len(items),
+        }
+
+    def h_instruments_admin(self, req: Request) -> dict:
+        items = self.web.list_instruments(
+            asset_type=req.q("type"), query=req.q("q")
+        )
+        return {"items": items, "types": type_options(), "total": len(items)}
+
+    def h_instruments_validate(self, req: Request) -> dict:
+        result = validate_instrument(req.body, partial=bool(req.body.get("_partial")))
+        payload = result.as_dict()
+        if result.ok:
+            existing = self.web.find_instrument(result.data["symbol_key"])
+            payload["duplicate"] = existing is not None
+            payload["existing"] = (
+                {"id": existing["id"], "code": existing["code"], "name": existing["name"]}
+                if existing
+                else None
+            )
+        return payload
+
+    def h_instruments_create(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        result = validate_instrument(req.body)
+        if not result.ok:
+            raise ApiError(
+                "VALIDATION_FAILED",
+                "；".join(f"{i.field}: {i.message}" for i in result.issues),
+                400,
+                details=[i.as_dict() for i in result.issues],
+            )
+        existing = self.web.find_instrument(result.data["symbol_key"])
+        if existing is not None:
+            raise ApiError(
+                "DUPLICATE",
+                f"标的已存在：{existing['code']} {existing['name']}（{existing['asset_type']}/{existing['market']}）",
+                409,
+                details={"existing": {"id": existing["id"], "code": existing["code"]}},
+            )
+        iid = self.web.create_instrument(result.data)
+        self.web.audit(
+            uid=p.uid, username=p.username, action="instrument_create",
+            target=result.data["symbol_key"], detail=result.data["name"], ip=req.ip,
+        )
+        return {"id": iid, "item": self.web.get_instrument(iid)}
+
+    def h_instruments_update(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        iid = int(req.params["iid"])
+        current = self.web.get_instrument(iid)
+        if current is None:
+            raise ApiError("NOT_FOUND", "标的不存在", 404)
+
+        merged = {**current, **req.body}
+        result = validate_instrument(merged)
+        if not result.ok:
+            raise ApiError(
+                "VALIDATION_FAILED",
+                "；".join(f"{i.field}: {i.message}" for i in result.issues),
+                400,
+                details=[i.as_dict() for i in result.issues],
+            )
+        if result.data["symbol_key"] != current["symbol_key"]:
+            other = self.web.find_instrument(result.data["symbol_key"])
+            if other is not None:
+                raise ApiError(
+                    "DUPLICATE",
+                    f"与已有标的冲突：{other['code']} {other['name']}",
+                    409,
+                    details={"existing": {"id": other["id"], "code": other["code"]}},
+                )
+        self.web.update_instrument(iid, result.data)
+        self.web.audit(
+            uid=p.uid, username=p.username, action="instrument_update",
+            target=result.data["symbol_key"], ip=req.ip,
+        )
+        return {"id": iid, "item": self.web.get_instrument(iid)}
+
+    def h_instruments_delete(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        iid = int(req.params["iid"])
+        current = self.web.get_instrument(iid)
+        if current is None:
+            raise ApiError("NOT_FOUND", "标的不存在", 404)
+        self.web.delete_instrument(iid)
+        self.web.audit(
+            uid=p.uid, username=p.username, action="instrument_delete",
+            target=current["symbol_key"], ip=req.ip,
+        )
+        return {"id": iid, "deleted": True, "code": current["code"]}
+
+    def h_instruments_reorder(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        ids = req.body.get("ids")
+        if not isinstance(ids, list) or not ids:
+            raise ApiError("BAD_REQUEST", "ids 必须是非空数组")
+        try:
+            ids = [int(i) for i in ids]
+        except (TypeError, ValueError) as exc:
+            raise ApiError("BAD_REQUEST", "ids 必须是整数数组") from exc
+        if len(set(ids)) != len(ids):
+            raise ApiError("BAD_REQUEST", "ids 存在重复项")
+        known = {i["id"] for i in self.web.list_instruments()}
+        unknown = [i for i in ids if i not in known]
+        if unknown:
+            raise ApiError("NOT_FOUND", f"标的不存在：{unknown}", 404)
+        self.web.reorder_instruments(ids)
+        self.web.audit(
+            uid=p.uid, username=p.username, action="instrument_reorder",
+            target=f"{len(ids)} items", ip=req.ip,
+        )
+        return {"ordered": len(ids)}
+
+    def h_instruments_batch(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        rows = req.body.get("rows")
+        if rows is None:
+            text = req.body.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise ApiError("BAD_REQUEST", "请提供 rows 数组或待解析的 text")
+            rows = parse_batch_text(text)
+        if not isinstance(rows, list) or not rows:
+            raise ApiError("BAD_REQUEST", "没有可导入的行")
+        if len(rows) > 500:
+            raise ApiError("BAD_REQUEST", "单次最多导入 500 条")
+
+        results: list[dict] = []
+        created = duplicated = invalid = 0
+        seen: set[str] = set()
+
+        for index, raw in enumerate(rows, start=1):
+            if not isinstance(raw, dict):
+                invalid += 1
+                results.append({"line": index, "code": "", "status": "invalid",
+                                "issues": [{"field": "-", "message": "行格式错误"}]})
+                continue
+
+            result = validate_instrument(raw)
+            code = str(raw.get("code") or "")
+            if not result.ok:
+                invalid += 1
+                results.append({
+                    "line": index, "code": code, "status": "invalid",
+                    "issues": [i.as_dict() for i in result.issues],
+                })
+                continue
+
+            key = result.data["symbol_key"]
+            existing = self.web.find_instrument(key)
+            if key in seen or existing is not None:
+                duplicated += 1
+                results.append({
+                    "line": index, "code": result.data["code"], "status": "duplicate",
+                    "existing_id": existing["id"] if existing else None,
+                    "message": "本批内重复" if key in seen else "已存在于标的库",
+                })
+                continue
+
+            seen.add(key)
+            iid = self.web.create_instrument(result.data)
+            created += 1
+            results.append({
+                "line": index, "code": result.data["code"], "name": result.data["name"],
+                "status": "created", "id": iid,
+            })
+
+        self.web.audit(
+            uid=p.uid, username=p.username, action="instrument_import",
+            target=f"{created} created / {duplicated} dup / {invalid} invalid", ip=req.ip,
+        )
+        return {
+            "total": len(rows),
+            "created": created,
+            "duplicated": duplicated,
+            "invalid": invalid,
+            "items": results,
+        }
+
+    def _execute_backtest(
+        self,
+        cfg_path: Path,
+        overrides: dict[str, Any],
+        owner: int,
+        selection: list[dict] | None = None,
+    ) -> dict:
         from dataclasses import replace
 
         from ..config import load_config
@@ -473,6 +773,19 @@ class Api:
         if overrides:
             params = {**cfg.strategy.params, **overrides}
             cfg = replace(cfg, strategy=replace(cfg.strategy, params=params))
+        if selection:
+            # 用标的库里的精度覆盖配置：不同市场的最小变动价位差别很大，
+            # 沿用配置里的默认值会导致撮合与风控按错误精度取整。
+            cfg = replace(
+                cfg,
+                market=replace(
+                    cfg.market,
+                    symbols=tuple(i["code"] for i in selection),
+                    price_tick=float(selection[0]["price_tick"]),
+                    qty_step=float(selection[0]["qty_step"]),
+                    min_notional=max(float(i["min_notional"]) for i in selection),
+                ),
+            )
 
         run_id = f"web-{cfg.strategy.name}-{now_ms()}"
         strategy = create_strategy(cfg.strategy.name, cfg.strategy.params)
@@ -655,6 +968,7 @@ class Api:
                 "tables": stats,
             },
             "microstructure": flow,
+            "instruments": {"count": self.web.instrument_count()},
             "risk": {"kill_switch": self.kill_file.exists()},
             "configs": sorted(p.stem for p in self.config_dir.glob("*.toml")),
             "jobs": self._jobs_all()[:20],

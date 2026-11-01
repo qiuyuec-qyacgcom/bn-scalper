@@ -25,6 +25,7 @@
 
     <div class="nav-item active" data-view="overview"><span class="ico">▤</span>概览</div>
     <div class="nav-item" data-view="users"><span class="ico">☺</span>用户与权限</div>
+    <div class="nav-item" data-view="instruments"><span class="ico">◆</span>标的库</div>
     <div class="nav-item" data-view="config"><span class="ico">⚙</span>系统配置</div>
     <div class="nav-item" data-view="data"><span class="ico">⇩</span>数据管理</div>
     <div class="nav-item" data-view="risk"><span class="ico">⛔</span>风控开关</div>
@@ -73,6 +74,29 @@
           <button class="btn primary" id="newUserBtn">新建用户</button>
         </div>
         <div class="card pad0"><div class="table-wrap"><table id="userTable"></table></div></div>
+      </section>
+
+      <!-- 标的库 -->
+      <section class="view" id="view-instruments">
+        <div class="toolbar">
+          <div class="field" style="width:160px"><label>资产类型</label>
+            <select id="instTypeFilter"><option value="">全部</option></select></div>
+          <div class="field" style="width:200px"><label>搜索</label>
+            <input id="instQuery" type="text" placeholder="代码或名称，回车搜索" /></div>
+          <div class="grow"></div>
+          <button class="btn" id="instRefresh">刷新</button>
+          <button class="btn" id="instBatchBtn">批量导入</button>
+          <button class="btn primary" id="instNewBtn">新增标的</button>
+        </div>
+        <div class="hint-box">
+          标的库是全局主数据：新增后<b>立即</b>出现在前台筛选与回测选择中。
+          判重键为 <b>类型 + 市场 + 代码</b>——例如 <span class="mono">000001</span> 在深市是平安银行、在沪市是上证指数，
+          两者互不冲突；同一市场下重复则会被拒绝。
+        </div>
+        <div class="card pad0">
+          <div class="table-wrap"><table id="instrumentTable"></table></div>
+          <div class="card-body" style="padding-top:10px"><span class="dim" id="instSummary"></span></div>
+        </div>
       </section>
 
       <!-- 配置 -->

@@ -96,8 +96,8 @@
       <!-- 交易明细 -->
       <section class="view" id="view-trades">
         <div class="toolbar">
-          <div class="field" style="width:180px"><label>标的</label>
-            <input id="tradeSymbol" type="text" placeholder="全部（如 BTCUSDT）" /></div>
+          <div class="field" style="width:200px"><label>标的</label>
+            <input id="tradeSymbol" type="text" list="instrumentList" placeholder="全部（如 BTCUSDT）" /></div>
           <div class="field" style="width:140px"><label>每页</label>
             <select id="tradeLimit"><option>50</option><option>100</option><option>200</option></select></div>
           <div class="grow"></div>
@@ -132,10 +132,15 @@
 
       <!-- 运行记录 -->
       <section class="view" id="view-runs">
-        <div class="toolbar">
-          <div class="hint-box" style="margin:0">仅显示你有权限查看的运行。管理员可见全部。</div>
-          <div class="grow"></div>
-          <button class="btn primary" id="runBacktestBtn">运行新回测</button>
+        <div class="toolbar" style="align-items:flex-start">
+          <div style="flex:1;min-width:220px">
+            <div class="hint-box" style="margin:0 0 10px">仅显示你有权限查看的运行。管理员可见全部。</div>
+            <div class="field" style="max-width:320px">
+              <label>标的选择（可多选，留空则用配置默认）</label>
+              <select id="backtestSymbols" multiple size="4" style="width:100%"></select>
+            </div>
+          </div>
+          <button class="btn primary" id="runBacktestBtn" style="align-self:flex-end">运行新回测</button>
         </div>
         <div class="card pad0"><div class="table-wrap"><table id="runTable"></table></div></div>
       </section>
@@ -144,6 +149,7 @@
   </main>
 </div>
 
+<datalist id="instrumentList"></datalist>
 <div class="toast-host" id="toastHost"></div>
 
 <script src="/static/app.js"></script>

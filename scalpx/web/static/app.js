@@ -66,6 +66,7 @@ async function api(path, { method = 'GET', body = null } = {}) {
     const code = payload?.error?.code || 'ERROR';
     const err = new Error(msg);
     err.code = code;
+    err.details = payload?.error?.details;
     throw err;
   }
   return payload ? payload.data : null;
@@ -442,12 +443,38 @@ async function loadMicro() {
   });
 }
 
+/** 拉取标的库：填充筛选补全与回测标的选择 */
+async function loadInstruments() {
+  let items = [];
+  try {
+    const d = await api('/api/instruments?active_only=1');
+    items = d.items || [];
+  } catch { return; }
+
+  const dl = $('#instrumentList');
+  if (dl) {
+    dl.innerHTML = items.map(i => `<option value="${i.code}">${i.name}</option>`).join('');
+  }
+
+  const sel = $('#backtestSymbols');
+  if (sel) {
+    const keep = new Set(Array.from(sel.selectedOptions).map(o => o.value));
+    sel.innerHTML = items.length
+      ? items.map(i => `<option value="${i.code}" ${keep.has(i.code) ? 'selected' : ''}>${i.code} · ${i.name}</option>`).join('')
+      : '<option value="" disabled>（标的库为空，请在后台添加）</option>';
+  }
+}
+
 async function submitBacktest() {
   const btn = $('#runBacktestBtn');
   btn.disabled = true;
   btn.textContent = '提交中…';
   try {
-    const d = await api('/api/backtest', { method: 'POST', body: { profile: 'backtest' } });
+    const sel = $('#backtestSymbols');
+    const symbols = sel ? Array.from(sel.selectedOptions).map(o => o.value).filter(Boolean) : [];
+    const body = { profile: 'backtest' };
+    if (symbols.length) body.symbols = symbols;
+    const d = await api('/api/backtest', { method: 'POST', body });
     toast(`已提交回测任务，排队中…`, 'ok');
     pollJob(d.job_id);
   } catch (err) {
@@ -515,6 +542,7 @@ async function bootstrap() {
     $('#footVersion').textContent = health.version;
   } catch { /* 忽略 */ }
 
+  await loadInstruments();
   await loadRuns();
   switchView('dashboard');
 }

@@ -243,6 +243,172 @@ class TestRiskControl(WebTestCase):
         self.assertTrue(any(a.startswith("risk_") for a in actions))
 
 
+class TestInstrumentsApi(WebTestCase):
+    """标的库接口：增删改查、判重、批量导入、排序与权限。"""
+
+    def setUp(self) -> None:
+        self.token = self.login("admin", "admin-pass-123")
+        # 每个用例从干净状态开始：清掉上一轮留下的标的
+        _, listing = self.call("GET", "/api/admin/instruments", token=self.token)
+        for item in listing["data"]["items"]:
+            self.call("DELETE", f"/api/admin/instruments/{item['id']}", token=self.token)
+
+    def create(self, **payload):
+        return self.call("POST", "/api/admin/instruments", body=payload, token=self.token)
+
+    def test_create_then_visible_immediately(self) -> None:
+        status, payload = self.create(code="BTCUSDT", name="比特币", asset_type="crypto")
+        self.assertEqual(status, 200, payload)
+        iid = payload["data"]["id"]
+
+        # 前台接口立即可见（无需刷新缓存）
+        status, listing = self.call("GET", "/api/instruments", token=self.token)
+        self.assertEqual(status, 200)
+        codes = [i["code"] for i in listing["data"]["items"]]
+        self.assertIn("BTCUSDT", codes)
+        self.assertEqual(listing["data"]["total"], 1)
+
+        _, admin_list = self.call("GET", "/api/admin/instruments", token=self.token)
+        item = admin_list["data"]["items"][0]
+        self.assertEqual(item["id"], iid)
+        self.assertEqual(item["asset_type"], "crypto")
+        self.assertEqual(item["market"], "BINANCE")
+
+    def test_normalization_applied_on_create(self) -> None:
+        status, payload = self.create(code="btc/usdt", name="比特币", asset_type="crypto")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["data"]["item"]["code"], "BTCUSDT")
+
+    def test_duplicate_rejected_with_existing_id(self) -> None:
+        _, first = self.create(code="BTCUSDT", name="比特币", asset_type="crypto")
+        status, payload = self.create(code="btc-usdt", name="另一个名字", asset_type="crypto")
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"]["code"], "DUPLICATE")
+        self.assertEqual(payload["error"]["details"]["existing"]["id"], first["data"]["id"])
+
+    def test_same_code_different_market_allowed(self) -> None:
+        self.assertEqual(self.create(code="000001", name="平安银行", asset_type="stock", market="SZ")[0], 200)
+        self.assertEqual(self.create(code="000001", name="上证指数", asset_type="stock", market="SH")[0], 200)
+
+    def test_invalid_payload_returns_field_issues(self) -> None:
+        status, payload = self.create(code="123", name="", asset_type="stock", market="SH")
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "VALIDATION_FAILED")
+        fields = {d["field"] for d in payload["error"]["details"]}
+        self.assertIn("code", fields)
+        self.assertIn("name", fields)
+
+    def test_validate_endpoint_flags_duplicate(self) -> None:
+        self.create(code="BTCUSDT", name="比特币", asset_type="crypto")
+        status, payload = self.call(
+            "POST", "/api/admin/instruments/validate",
+            body={"code": "BTCUSDT", "name": "比特币", "asset_type": "crypto"}, token=self.token,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["data"]["valid"])
+        self.assertTrue(payload["data"]["duplicate"])
+
+    def test_batch_import_counts(self) -> None:
+        self.create(code="BTCUSDT", name="比特币", asset_type="crypto")
+        text = "\n".join([
+            "# 已存在",                                    # 注释
+            "ETHUSDT,以太坊,crypto",                       # 新增
+            "600519,贵州茅台,stock,SH",                    # 新增
+            "ethusdt,以太坊重复,crypto",                    # 批内重复
+            "BTCUSDT,比特币,crypto",                       # 库内重复
+            "BAD,坏数据,stock,SH",                         # 非法
+        ])
+        status, payload = self.call(
+            "POST", "/api/admin/instruments/batch", body={"text": text}, token=self.token
+        )
+        self.assertEqual(status, 200, payload)
+        d = payload["data"]
+        self.assertEqual(d["total"], 5)
+        self.assertEqual(d["created"], 2)
+        self.assertEqual(d["duplicated"], 2)
+        self.assertEqual(d["invalid"], 1)
+
+        _, listing = self.call("GET", "/api/instruments", token=self.token)
+        self.assertEqual(listing["data"]["total"], 3)
+
+    def test_update_and_conflict(self) -> None:
+        _, a = self.create(code="600519", name="茅台", asset_type="stock", market="SH")
+        self.create(code="600036", name="招商银行", asset_type="stock", market="SH")
+        self.create(code="000858", name="五粮液", asset_type="stock", market="SZ")
+        iid = a["data"]["id"]
+
+        status, payload = self.call(
+            "PATCH", f"/api/admin/instruments/{iid}", body={"name": "贵州茅台"}, token=self.token
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["data"]["item"]["name"], "贵州茅台")
+
+        # 同一市场下改成已存在的代码 -> 冲突
+        status, payload = self.call(
+            "PATCH", f"/api/admin/instruments/{iid}", body={"code": "600036"}, token=self.token
+        )
+        self.assertEqual(status, 409, payload)
+
+        # 只换市场、代码不变：600519 在深市并不存在 -> 是另一个合法标的
+        status, payload = self.call(
+            "PATCH", f"/api/admin/instruments/{iid}", body={"market": "SZ"}, token=self.token
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["data"]["item"]["market"], "SZ")
+        self.assertEqual(payload["data"]["item"]["code"], "600519")
+
+    def test_reorder_changes_listing_order(self) -> None:
+        ids = []
+        for code in ("AAAUSDT", "BBBUSDT", "CCCUSDT"):
+            _, p = self.create(code=code, name=code, asset_type="crypto")
+            ids.append(p["data"]["id"])
+        reversed_ids = list(reversed(ids))
+        status, payload = self.call(
+            "PUT", "/api/admin/instruments/order", body={"ids": reversed_ids}, token=self.token
+        )
+        self.assertEqual(status, 200, payload)
+        _, listing = self.call("GET", "/api/instruments", token=self.token)
+        self.assertEqual([i["id"] for i in listing["data"]["items"]], reversed_ids)
+
+    def test_delete(self) -> None:
+        _, p = self.create(code="BTCUSDT", name="比特币", asset_type="crypto")
+        iid = p["data"]["id"]
+        status, _ = self.call("DELETE", f"/api/admin/instruments/{iid}", token=self.token)
+        self.assertEqual(status, 200)
+        _, listing = self.call("GET", "/api/instruments", token=self.token)
+        self.assertEqual(listing["data"]["total"], 0)
+
+        status, payload = self.call("DELETE", f"/api/admin/instruments/{iid}", token=self.token)
+        self.assertEqual(status, 404)
+
+    def test_user_cannot_write(self) -> None:
+        user_token = self.login("alice", "user-pass-123")
+        status, payload = self.call(
+            "POST", "/api/admin/instruments",
+            body={"code": "BTCUSDT", "name": "比特币", "asset_type": "crypto"}, token=user_token,
+        )
+        self.assertEqual(status, 403)
+        # 但可以读
+        status, _ = self.call("GET", "/api/instruments", token=user_token)
+        self.assertEqual(status, 200)
+
+    def test_backtest_rejects_unregistered_symbol(self) -> None:
+        status, payload = self.call(
+            "POST", "/api/backtest", body={"profile": "backtest", "symbols": ["NOTUSDT"]}, token=self.token
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"]["code"], "INSTRUMENT_NOT_FOUND")
+        self.assertEqual(payload["error"]["details"]["missing"], ["NOTUSDT"])
+
+    def test_backtest_rejects_registered_symbol_without_data(self) -> None:
+        self.create(code="FAKEUSDT", name="假标的", asset_type="crypto")
+        status, payload = self.call(
+            "POST", "/api/backtest", body={"profile": "backtest", "symbols": ["FAKEUSDT"]}, token=self.token
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "DATA_MISSING")
+
+
 class TestStatic(WebTestCase):
     def test_index_served(self) -> None:
         url = f"http://127.0.0.1:{self.port}/"

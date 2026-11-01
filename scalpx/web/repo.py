@@ -57,6 +57,26 @@ CREATE TABLE IF NOT EXISTS quota (
     used   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (uid, day)
 );
+CREATE TABLE IF NOT EXISTS instruments (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol_key   TEXT NOT NULL UNIQUE,
+    code         TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    asset_type   TEXT NOT NULL,
+    market       TEXT NOT NULL,
+    currency     TEXT NOT NULL DEFAULT '',
+    price_tick   REAL NOT NULL DEFAULT 0.01,
+    qty_step     REAL NOT NULL DEFAULT 1,
+    min_notional REAL NOT NULL DEFAULT 0,
+    lot_size     REAL NOT NULL DEFAULT 0,
+    is_active    INTEGER NOT NULL DEFAULT 1,
+    sort_order   INTEGER NOT NULL DEFAULT 0,
+    meta_json    TEXT NOT NULL DEFAULT '{}',
+    created_ts   INTEGER NOT NULL,
+    updated_ts   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inst_sort ON instruments(sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_inst_type ON instruments(asset_type, market);
 """
 
 
@@ -219,6 +239,125 @@ class WebRepo:
             )
             self._conn.commit()
             return True, used + 1
+
+    # ------------------------------------------------------------------ #
+    # 标的库
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _instrument_row(row: sqlite3.Row) -> dict:
+        item = dict(row)
+        item["is_active"] = bool(item["is_active"])
+        try:
+            item["meta"] = json.loads(item.pop("meta_json") or "{}")
+        except json.JSONDecodeError:
+            item["meta"] = {}
+            item.pop("meta_json", None)
+        return item
+
+    def list_instruments(
+        self, *, asset_type: str = "", query: str = "", active_only: bool = False
+    ) -> list[dict]:
+        sql = "SELECT * FROM instruments WHERE 1=1"
+        params: list[Any] = []
+        if asset_type:
+            sql += " AND asset_type = ?"
+            params.append(asset_type)
+        if query:
+            sql += " AND (code LIKE ? OR name LIKE ?)"
+            like = f"%{query}%"
+            params.extend([like, like])
+        if active_only:
+            sql += " AND is_active = 1"
+        sql += " ORDER BY sort_order ASC, id ASC"
+        return [self._instrument_row(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def get_instrument(self, iid: int) -> dict | None:
+        row = self._conn.execute("SELECT * FROM instruments WHERE id = ?", (iid,)).fetchone()
+        return self._instrument_row(row) if row else None
+
+    def find_instrument(self, symbol_key: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM instruments WHERE symbol_key = ?", (symbol_key,)
+        ).fetchone()
+        return self._instrument_row(row) if row else None
+
+    def create_instrument(self, data: dict) -> int:
+        now = int(time.time())
+        with self._lock:
+            order = self._conn.execute(
+                "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM instruments"
+            ).fetchone()[0]
+            cur = self._conn.execute(
+                "INSERT INTO instruments(symbol_key, code, name, asset_type, market, currency, "
+                "price_tick, qty_step, min_notional, lot_size, is_active, sort_order, meta_json, "
+                "created_ts, updated_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    data["symbol_key"],
+                    data["code"],
+                    data["name"],
+                    data["asset_type"],
+                    data["market"],
+                    data.get("currency", ""),
+                    float(data.get("price_tick", 0.01)),
+                    float(data.get("qty_step", 1.0)),
+                    float(data.get("min_notional", 0.0)),
+                    float(data.get("lot_size", 0.0)),
+                    1 if data.get("is_active", True) else 0,
+                    int(order),
+                    json.dumps(data.get("meta", {}), ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def update_instrument(self, iid: int, data: dict) -> bool:
+        allowed = {
+            "code", "name", "asset_type", "market", "currency", "price_tick",
+            "qty_step", "min_notional", "lot_size", "is_active", "sort_order",
+        }
+        fields: list[str] = []
+        params: list[Any] = []
+        for key, value in data.items():
+            if key == "meta":
+                fields.append("meta_json = ?")
+                params.append(json.dumps(value, ensure_ascii=False))
+            elif key == "symbol_key":
+                fields.append("symbol_key = ?")
+                params.append(value)
+            elif key in allowed:
+                fields.append(f"{key} = ?")
+                params.append(int(value) if key == "is_active" else value)
+        if not fields:
+            return False
+        fields.append("updated_ts = ?")
+        params.append(int(time.time()))
+        params.append(iid)
+        with self._lock:
+            cur = self._conn.execute(f"UPDATE instruments SET {', '.join(fields)} WHERE id = ?", params)
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def delete_instrument(self, iid: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM instruments WHERE id = ?", (iid,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def reorder_instruments(self, ids: list[int]) -> int:
+        """按给定顺序重排（步长 10，便于后续插入）。"""
+        with self._lock:
+            for index, iid in enumerate(ids):
+                self._conn.execute(
+                    "UPDATE instruments SET sort_order = ?, updated_ts = ? WHERE id = ?",
+                    ((index + 1) * 10, int(time.time()), int(iid)),
+                )
+            self._conn.commit()
+        return len(ids)
+
+    def instrument_count(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM instruments").fetchone()[0])
 
     def close(self) -> None:
         try:
