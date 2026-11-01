@@ -9,6 +9,13 @@ logs/
 # kill switch（运行时文件）
 data/KILL
 
+# 运行时密钥与凭据（绝不入库）
+# data/web/ 含会话签名密钥 secret.key 与初始管理员口令
+data/web/
+*.key
+*.pem
+initial_credentials.txt
+
 # Python
 __pycache__/
 *.py[cod]
