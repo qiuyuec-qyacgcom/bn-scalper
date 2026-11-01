@@ -108,7 +108,7 @@ strategy/   risk/     execution/  portfolio.py  data/
 ### 5 步跑通回测
 
 ```bash
-git clone <your-repo-url> scalpx && cd scalpx
+git clone https://github.com/qiuyuec-qyacgcom/bn-scalper.git && cd bn-scalper
 
 # 1. 生成联调数据（无网络也可用）
 python scripts/make_sample_data.py --days 30
