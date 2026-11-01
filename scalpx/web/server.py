@@ -15,8 +15,10 @@ import json
 import logging
 import mimetypes
 import os
+import platform
 import signal
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -427,23 +429,80 @@ def cmd_reset_password(args) -> int:
 
 
 def cmd_check(args) -> int:
-    """自检：给安装脚本与运维用（不启动服务）。"""
+    """环境与部署自检（不启动服务）。
+
+    退出码：0=就绪 / 2=致命（缺静态资源、路径不可写）/ 3=待初始化（没有账号）
+    安装脚本用它做最后一道校验，运维用它快速定位"为什么起不来"。
+    """
     app = _build_app(args)
-    ok = True
-    print(f"root          : {app.root}")
-    print(f"config_dir    : {app.config_dir} ({'存在' if app.config_dir.exists() else '缺失'})")
-    print(f"trading_db    : {app.trading_db} ({'存在' if app.trading_db.exists() else '未创建'})")
-    print(f"web_db        : {app.web_db} ({'存在' if app.web_db.exists() else '未创建'})")
-    print(f"static        : {'存在' if STATIC_ROOT.exists() else '缺失'}")
-    print(f"users         : {app.web_repo.user_count()}")
-    print(f"trading tables: {sum(1 for _ in app.trading_repo.table_stats().items())}")
-    if not STATIC_ROOT.exists():
-        ok = False
-    if app.web_repo.user_count() == 0:
-        ok = False
+    blocking: list[str] = []
+    warnings: list[str] = []
+
+    def line(name: str, value: str) -> None:
+        print(f"  {name:<16}: {value}")
+
+    print("[runtime]")
+    line("python", sys.version.split()[0])
+    line("platform", f"{platform.system()} {platform.release()}")
+    line("sqlite", sqlite3.sqlite_version)
+
+    print("\n[paths]")
+    line("root", str(app.root))
+    writable = os.access(app.root, os.W_OK) if app.root.exists() else False
+    line("root writable", "yes" if writable else "NO")
+    if not writable:
+        blocking.append(f"安装目录不可写：{app.root}")
+
+    line("static", "ok" if STATIC_ROOT.is_dir() else "MISSING")
+    if not STATIC_ROOT.is_dir():
+        blocking.append("缺少 static/ 目录，前端不可用")
+
+    line("config_dir", f"{app.config_dir} ({'ok' if app.config_dir.is_dir() else 'MISSING'})")
+    if not app.config_dir.is_dir():
+        blocking.append(f"配置目录不存在：{app.config_dir}")
+    else:
+        profiles = sorted(p.stem for p in app.config_dir.glob("*.toml"))
+        line("profiles", ", ".join(profiles) or "none")
+        if "backtest" not in profiles:
+            warnings.append("缺少 backtest.toml，无法运行回测")
+
+    print("\n[database]")
+    line("web_db", f"{app.web_db} ({'ok' if app.web_db.exists() else 'new'})")
+    line("trading_db", f"{app.trading_db} ({'ok' if app.trading_db.exists() else 'absent'})")
+    if not app.trading_db.exists():
+        warnings.append("交易库尚未创建（跑过回测后自动生成）")
+
+    users = app.web_repo.user_count()
+    line("users", str(users))
+    admins = sum(1 for u in app.web_repo.list_users() if u["role"] == "admin" and u["status"] == "active")
+    line("active admins", str(admins))
+    if users == 0:
+        blocking.append("没有任何账号，请先执行 create-user")
+    elif admins == 0:
+        blocking.append("没有启用的管理员，后台无法登录")
+
+    line("instruments", str(app.web_repo.instrument_count()))
+
+    print("\n[ai]")
+    from .ai import AIConfig
+
+    cfg_ai = AIConfig.from_env()
+    line("mode", cfg_ai.describe()["mode"])
+    if not cfg_ai.enabled:
+        warnings.append("未配置大模型密钥，AI 功能运行在本地规则模式")
+
     app.close()
-    print("结果: " + ("OK" if ok else "NEED_INIT"))
-    return 0 if ok else 3
+
+    print("\n[result]")
+    for item in blocking:
+        print(f"  \033[31m✘ {item}\033[0m")
+    for item in warnings:
+        print(f"  \033[33m! {item}\033[0m")
+    if blocking:
+        print("  状态: FAIL")
+        return 2
+    print("  状态: " + ("OK" if not warnings else "OK (with warnings)"))
+    return 0 if users else 3
 
 
 def main(argv: list[str] | None = None) -> int:

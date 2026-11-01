@@ -93,6 +93,15 @@ class TestHealthAndAuth(WebTestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["data"]["status"], "ok")
 
+    def test_health_exposes_installer_contract(self) -> None:
+        """healthcheck.sh 与安装器依赖这几个字段，改动即回归。"""
+        _, payload = self.call("GET", "/api/health")
+        data = payload["data"]
+        self.assertIn("checks", data)
+        for key in ("web_db", "static", "config"):
+            self.assertTrue(data["checks"][key], f"check {key} 应为 True")
+        self.assertIn("users", data)
+
     def test_bad_login_rejected(self) -> None:
         status, payload = self.call("POST", "/api/auth/login", body={"username": "admin", "password": "wrong-pass"})
         self.assertEqual(status, 401)

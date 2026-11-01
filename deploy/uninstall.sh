@@ -2,28 +2,29 @@
 # =============================================================================
 #  scalpx-web 卸载脚本（install.sh --uninstall 的薄封装）
 #
-#  行为：
-#    1) 停止并禁用系统服务
-#    2) 删除 service 文件
-#    3) 询问是否删除安装目录（默认保留数据）
+#  行为：
+#    1) 停止并禁用系统服务（systemd / OpenRC / nohup）
+#    2) 删除 unit、init 脚本与日志轮转配置
+#    3) 询问是否删除安装目录 —— **默认保留数据**
 #
 #  用法：
-#    bash deploy/uninstall.sh              # 交互确认
-#    bash deploy/uninstall.sh -y           # 全自动（会删除数据目录，谨慎）
-#    bash deploy/uninstall.sh --keep-data  # 全自动但保留数据
+#    bash deploy/uninstall.sh                # 交互确认，保留数据
+#    bash deploy/uninstall.sh -y             # 不交互，仍保留数据
+#    bash deploy/uninstall.sh --purge -y     # 连数据目录一起删除（不可恢复）
+#    bash deploy/uninstall.sh --dir /srv/scalpx
 # =============================================================================
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-ARGS=("--uninstall")
+ARGS=(--uninstall)
 for arg in "$@"; do
   case "$arg" in
-    --keep-data) ;;                 # 由 install.sh 的交互分支处理，这里不透传
-    --dir=*) ARGS+=("--dir" "${arg#--dir=}") ;;
+    --keep-data) ;;                 # 保留数据是默认行为，无需透传
     -h|--help)
-      echo "用法: bash deploy/uninstall.sh [-y] [--dir=路径]"
-      exit 0 ;;
+      sed -n '2,18p' "$0"
+      exit 0
+      ;;
     *) ARGS+=("$arg") ;;
   esac
 done

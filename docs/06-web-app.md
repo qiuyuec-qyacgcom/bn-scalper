@@ -277,22 +277,34 @@ scalpx/web/
 # 在项目根目录
 bash deploy/install.sh                 # 交互式
 bash deploy/install.sh -y --port 9000  # 静默
+bash deploy/install.sh --check         # 只自检
+bash deploy/install.sh --dry-run       # 预演
+bash deploy/install.sh --upgrade -y    # 升级（保留数据与配置）
+bash deploy/install.sh --rollback      # 回滚到最近备份
 bash deploy/install.sh --no-service --dir ~/scalpx   # 只部署文件（容器/开发机）
 ```
 
 安装完成后终端会输出访问地址与**初始管理员凭据**（同时落盘到
 `<安装目录>/data/web/initial_credentials.txt`，权限 600）。
 
-### 5.2 六个阶段（流程与校验点）
+### 5.2 八个阶段（流程与校验点）
+
+> 安装器已升级到 v2，完整手册见 [deploy/README.md](../deploy/README.md)。
+> 每个阶段都登记回滚动作，失败即反向撤销（退出码 7）。
 
 | # | 阶段 | 具体动作 | 失败处理 |
 |---|---|---|---|
-| 1 | 环境检测 | 识别发行版/包管理器/init 系统/架构；检查内存、磁盘、端口占用、重复安装 | 端口占用直接中止并提示换端口 |
-| 2 | 依赖检测与安装 | 查找 Python ≥ 3.11；缺失则按包管理器安装；校验 `sqlite3/hmac/http.server` 可导入 | 安装后仍不满足则中止 |
-| 3 | 目录与运行用户 | 创建系统用户 `scalpx`（root 时）、`data/ web/ runs/ logs/`、同步代码（rsync 或 tar 管道） | 权限/复制失败即中止 |
-| 4 | 配置与账号生成 | 生成 `secret.key`（已有则保留）、复制 TOML（已有则保留）、用户表为空时创建 admin 并写凭据 | 生成失败即中止 |
-| 5 | 注册并启动服务 | systemd（含安全加固）或 OpenRC；都没有则退出为 `nohup` + pid 文件 | 启动失败打印 `systemctl status` 与日志尾部 |
-| 6 | 健康校验与自检 | 轮询 `/api/health` 最多 30 次；再跑 `scalpx.web check` | 超时打印日志尾部并中止 |
+| 1 | 环境检测 | 发行版/包管理器/init/架构、bash ≥4、源码完整性、内存磁盘（告警）、端口占用（阻断） | 端口占用中止（退出码 3） |
+| 2 | 依赖检测安装 | Python ≥3.11 探测，缺失按包管理器安装；校验 `sqlite3/hmac/http.server` | 装不上则中止（退出码 4） |
+| 3 | 目录与用户 | 系统用户、`data/web runs logs`、权限 | 回滚已建目录/用户 |
+| 4 | 备份与同步 | 备份旧代码与配置 → rsync/tar 同步（排除 `data/runs/logs/config`） | 回滚旧代码 |
+| 5 | 配置与账号 | `secret.key`（保留）、TOML（缺失才复制）、空表才建 admin 并写凭据 | 回滚密钥/账号 |
+| 6 | 服务注册 | systemd（加固）或 OpenRC；都没有则 `nohup`；logrotate | 回滚 unit |
+| 7 | 启动服务 | 停旧进程 → 启动 → 记录 pid | 中止（退出码 5） |
+| 8 | 健康校验 | 轮询 `/api/health` ≤40s，校验 web_db/static/config，再跑 `scalpx.web check` | 超时打印日志（退出码 6） |
+
+支持的动作：`--check`（只自检）、`--dry-run`（预演）、`--upgrade`（保留数据与配置）、
+`--rollback`（按备份恢复）、`--uninstall [--purge]`。
 
 ### 5.3 环境适配
 
@@ -322,8 +334,10 @@ bash deploy/install.sh --no-service --dir ~/scalpx   # 只部署文件（容器/
 ### 5.5 卸载
 
 ```bash
-bash deploy/uninstall.sh            # 交互：是否删除数据目录
-bash deploy/uninstall.sh -y         # 全自动（含删除数据）
+bash deploy/uninstall.sh              # 交互：是否删除数据目录
+bash deploy/uninstall.sh -y           # 全自动，**保留数据**
+bash deploy/uninstall.sh --purge -y   # 连数据目录一起删除（不可恢复）
+bash deploy/install.sh --rollback     # 从最近一次备份恢复
 ```
 
 停止并禁用服务、删除 unit 文件；数据目录默认保留。

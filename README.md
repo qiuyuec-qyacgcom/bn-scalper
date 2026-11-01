@@ -71,7 +71,7 @@
 | **标的库** | 股票 / 基金 / 债券 / 期货 / 外汇 / 加密全类型登记：按市场校验代码、批量导入自动去重、拖拽排序、即改即用 |
 | **可扩展后台** | schema 驱动的通用增改：交易账户 / 策略实例 / 风控档案 / 数据源；字段级校验、复合唯一键、审计留痕，新增一类数据只加一段声明 |
 | **AI 辅助** | 智能填充、自动纠错、自然语言增改（先出计划再确认执行）、结果解读；无模型密钥时自动降级为确定性规则模式 |
-| **一键部署** | `deploy/install.sh` 六段式：环境检测 → 依赖安装 → 目录用户 → 配置生成 → 服务注册 → 健康校验 |
+| **一键部署** | `deploy/install.sh` 八段式：环境检测 → 依赖安装 → 目录用户 → 备份同步 → 配置账号 → 服务注册 → 启动 → 健康校验；支持 `--dry-run` / `--check` / `--upgrade` / `--rollback` / `--purge`，失败自动回滚 |
 | **可观测** | 结构化日志 + SQLite 台账（orders/fills/trades/equity/signals/risk_events/bar_flow） |
 | **可测试** | 103 个用例：指标口径、撮合语义、保护单不变量、微观结构、权限与接口契约 |
 
@@ -179,8 +179,14 @@ bash deploy/install.sh -y --port 8787
 openSUSE（zypper）、macOS（brew）；无 systemd/OpenRC 时自动退化为 `nohup`。
 
 ```bash
-bash deploy/install.sh --help          # 全部参数
-bash deploy/uninstall.sh               # 卸载（默认保留数据）
+bash deploy/install.sh --check         # 只自检，不改系统
+bash deploy/install.sh --dry-run       # 预演，打印将执行的命令
+bash deploy/install.sh --upgrade -y    # 升级（保留 data/ 与 config/）
+bash deploy/install.sh --rollback      # 回滚到最近一次备份
+bash deploy/uninstall.sh               # 卸载（默认保留数据，--purge 才删）
+bash deploy/healthcheck.sh             # 外部健康探针（cron/监控用）
+
+# 完整参数、退出码、幂等性与回滚说明见 deploy/README.md
 ```
 
 ### 回测结果（合成数据，诚实结论）

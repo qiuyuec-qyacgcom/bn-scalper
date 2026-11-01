@@ -239,14 +239,37 @@ class Api:
     # 认证
     # ------------------------------------------------------------------ #
     def h_health(self, req: Request) -> dict:
+        """健康检查。
+
+        不只返回 "ok"：把安装脚本与监控真正关心的几项拆开暴露，
+        这样 `curl /api/health` 就能定位"到底是库坏了、静态资源丢了、还是配置目录不见了"。
+        """
+        static_dir = Path(__file__).parent / "static"
+        checks = {
+            "web_db": self._check_web_db(),
+            "static": (static_dir / "index.html").is_file() and (static_dir / "admin.html").is_file(),
+            "config": self.config_dir.is_dir(),
+            "trading_db": self.trading.available(),
+        }
+        # blocking 项不通过即视为不健康，wall 侧其余项只降级
+        healthy = checks["web_db"] and checks["static"] and checks["config"]
         return {
-            "status": "ok",
+            "status": "ok" if healthy else "degraded",
             "service": "scalpx-web",
             "version": web_version,
             "core": core_version,
             "uptime_s": int(time.time() - self.started_ts),
-            "trading_db": self.trading.available(),
+            "trading_db": checks["trading_db"],
+            "checks": checks,
+            "users": self.web.user_count(),
         }
+
+    def _check_web_db(self) -> bool:
+        try:
+            self.web.connection.execute("SELECT 1").fetchone()
+            return True
+        except Exception:  # noqa: BLE001 - 健康检查不应抛异常
+            return False
 
     def h_login(self, req: Request) -> dict:
         username = req.require("username", max_len=64)
