@@ -705,26 +705,73 @@ function instBatchModal() {
       $('#batchOk').onclick = async () => {
         const text = $('#batchText').value;
         if (!text.trim()) { toast('请填写内容', 'err'); return; }
+        const btn = $('#batchOk');
+        btn.disabled = true;
+        btn.textContent = '导入中…';
         try {
           const r = await api('/api/admin/instruments/batch', { method: 'POST', body: { text } });
-          const STATUS = {
-            created: '<span class="badge ok">新增</span>',
-            duplicate: '<span class="badge warn">跳过·重复</span>',
-            invalid: '<span class="badge bad">无效</span>',
-          };
-          $('#batchResult').innerHTML =
-            `<div style="margin-bottom:8px">共 ${r.total} 行：新增 <b class="up">${r.created}</b>，
-              去重 <b class="warn">${r.duplicated}</b>，无效 <b class="down">${r.invalid}</b></div>` +
-            r.items.map(it => `<div style="padding:3px 0;border-top:1px solid #1b2534">
-              第 ${it.line} 行 <span class="mono">${it.code || '-'}</span> ${STATUS[it.status] || it.status}
-              <span class="dim">${it.message || (it.issues ? it.issues.map(i => i.message).join('；') : '')}</span>
-            </div>`).join('');
+          renderBatchResult(r);
           toast(`导入完成：新增 ${r.created} 条`, 'ok');
           adminLoadInstruments();
-        } catch (err) { toast(err.message, 'err'); }
+        } catch (err) {
+          toast(err.message, 'err');
+        } finally {
+          btn.disabled = false;
+          btn.textContent = '开始导入';
+        }
       };
     }
   );
+}
+
+const BATCH_STATUS = {
+  created: '<span class="badge ok">新增</span>',
+  duplicate: '<span class="badge warn">跳过·重复</span>',
+  invalid: '<span class="badge bad">无效</span>',
+};
+
+function renderBatchResult(r) {
+  const host = $('#batchResult');
+  const failed = r.failed != null ? r.failed : (r.duplicated + r.invalid);
+  host.innerHTML =
+    `<div style="margin-bottom:8px">共 ${r.total} 行：新增 <b class="up">${r.created}</b>，
+      去重 <b class="warn">${r.duplicated}</b>，无效 <b class="down">${r.invalid}</b>
+      ${failed ? `，<b class="down">${failed} 行未入库</b>` : '，全部成功'}</div>` +
+    r.items.map(it => `<div style="padding:3px 0;border-top:1px solid var(--line-soft)">
+      第 ${it.line} 行 <span class="mono">${it.code || '-'}</span> ${BATCH_STATUS[it.status] || it.status}
+      <span class="dim">${it.message || (it.issues ? it.issues.map(i => i.message).join('；') : '')}</span>
+    </div>`).join('');
+
+  // 只重试"格式非法"的行；重复行重试也不会成功（除非先删掉库里那条）
+  if (r.retry_rows && r.retry_rows.length) {
+    const bar = document.createElement('div');
+    bar.style.cssText = 'margin-top:10px;display:flex;gap:8px;align-items:center';
+    const btn = document.createElement('button');
+    btn.className = 'btn sm primary';
+    btn.textContent = `重试失败行（${r.retry_rows.length}）`;
+    btn.onclick = () => retryInstrumentRows(r.retry_rows, btn);
+    bar.appendChild(btn);
+    const tip = document.createElement('span');
+    tip.className = 'dim';
+    tip.style.fontSize = '11px';
+    tip.textContent = '修正文本后可直接重试，已成功的行不会重复写入';
+    bar.appendChild(tip);
+    host.appendChild(bar);
+  }
+}
+
+async function retryInstrumentRows(rows, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = '重试中…'; }
+  try {
+    const r = await api('/api/admin/instruments/batch', { method: 'POST', body: { rows } });
+    renderBatchResult(r);
+    toast(`重试完成：新增 ${r.created} 条`, r.created ? 'ok' : 'err');
+    adminLoadInstruments();
+  } catch (err) {
+    toast(err.message, 'err');
+  } finally {
+    if (btn) { btn.disabled = false; }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -752,6 +799,7 @@ async function adminLoadEntities() {
   if (current && EntState.entities.some(e => e.key === current)) sel.value = current;
 
   await adminLoadEntityRows();
+  aiLoadConfig();
 }
 
 async function adminLoadEntityRows() {
@@ -1028,6 +1076,84 @@ function showExplanation(selector, ex) {
     (ex.suggestions && ex.suggestions.length
       ? `<ul style="margin:6px 0 0 16px;padding:0">${ex.suggestions.map(s => `<li>${s}</li>`).join('')}</ul>`
       : '');
+}
+
+/* ---------------- AI 配置面板 ---------------- */
+async function aiLoadConfig() {
+  const host = $('#aiCfgBody');
+  if (!host) return;
+  let d;
+  try {
+    d = await api('/api/admin/ai/config');
+  } catch (err) {
+    host.innerHTML = `<div class="down">${err.message}</div>`;
+    return;
+  }
+  const c = d.config || {};
+  const s = d.stats || {};
+  const cache = s.cache || {};
+  const mode = c.mode === 'llm' ? '大模型' : '本地规则';
+  const badgeCls = c.mode === 'llm' ? 'ok' : 'warn';
+
+  host.innerHTML = `
+    <div class="ai-stat" style="margin-bottom:10px">
+      <span>模式 <span class="badge ${badgeCls}">${mode}</span></span>
+      <span>模型 <b>${c.model || '—'}</b></span>
+      <span>密钥 <b>${c.key_configured ? '已配置' : '未配置'}</b></span>
+      <span>调用 <b>${s.calls || 0}</b>/成功 <b>${s.ok || 0}</b>/失败 <b>${s.failed || 0}</b></span>
+      <span>重试 <b>${s.retries || 0}</b> 超时 <b>${s.timeouts || 0}</b></span>
+      <span>缓存命中率 <b>${((cache.hit_rate || 0) * 100).toFixed(0)}%</b> (${cache.entries || 0} 条)</span>
+      <span>平均延迟 <b>${s.avg_latency_ms || 0}ms</b></span>
+    </div>
+    <div class="form-grid">
+      <div class="field"><label>启用模型</label>
+        <select id="aiCfgEnabled">
+          <option value="true" ${c.mode === 'llm' ? 'selected' : ''}>启用</option>
+          <option value="false" ${c.mode !== 'llm' ? 'selected' : ''}>停用（仅本地规则）</option>
+        </select></div>
+      <div class="field"><label>模型名</label><input id="aiCfgModel" value="${c.model || ''}" /></div>
+      <div class="field"><label>超时（秒）</label><input id="aiCfgTimeout" type="number" step="1" value="${c.timeout || 20}" /></div>
+      <div class="field"><label>重试次数</label><input id="aiCfgRetries" type="number" value="${c.max_retries ?? 2}" /></div>
+      <div class="field"><label>缓存 TTL（秒）</label><input id="aiCfgTtl" type="number" value="${c.cache_ttl ?? 300}" /></div>
+      <div class="field"><label>并发上限</label><input id="aiCfgConc" type="number" value="${c.max_concurrency ?? 2}" /></div>
+      <div class="field"><label>失败降级</label>
+        <select id="aiCfgFallback">
+          <option value="local" ${c.fallback === 'local' ? 'selected' : ''}>回退本地规则</option>
+          <option value="error" ${c.fallback === 'error' ? 'selected' : ''}>直接报错（严格模式）</option>
+        </select></div>
+      <div class="field" style="justify-content:flex-end;display:flex;gap:8px;align-items:flex-end">
+        <button class="btn sm" id="aiCfgClear">清空缓存</button>
+        <button class="btn sm primary" id="aiCfgSave">保存</button>
+      </div>
+    </div>`;
+
+  $('#aiCfgSave').onclick = async () => {
+    try {
+      const r = await api('/api/admin/ai/config', {
+        method: 'PUT',
+        body: {
+          config: {
+            enabled: $('#aiCfgEnabled').value === 'true',
+            model: $('#aiCfgModel').value.trim(),
+            timeout: Number($('#aiCfgTimeout').value),
+            max_retries: Number($('#aiCfgRetries').value),
+            cache_ttl: Number($('#aiCfgTtl').value),
+            max_concurrency: Number($('#aiCfgConc').value),
+            fallback: $('#aiCfgFallback').value,
+          },
+        },
+      });
+      toast(`已保存（${r.config.mode === 'llm' ? '大模型' : '本地规则'}）`, 'ok');
+      adminLoadEntities();
+    } catch (err) { toast(err.message, 'err'); }
+  };
+  $('#aiCfgClear').onclick = async () => {
+    try {
+      await api('/api/admin/ai/cache/clear', { method: 'POST' });
+      toast('缓存已清空', 'ok');
+      aiLoadConfig();
+    } catch (err) { toast(err.message, 'err'); }
+  };
 }
 
 async function aiParseCommand() {

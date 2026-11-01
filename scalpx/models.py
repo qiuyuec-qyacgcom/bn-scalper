@@ -98,6 +98,7 @@ class ExitReason(str, Enum):
     TRAILING_STOP = "trailing_stop"
     TIME_STOP = "time_stop"
     SIGNAL_FLIP = "signal_flip"
+    FLOW_REVERSAL = "flow_reversal"   # 订单流失衡反转（微观结构先于价格结构）
     RISK_LIQUIDATION = "risk_liquidation"
     MANUAL = "manual"
     KILL_SWITCH = "kill_switch"

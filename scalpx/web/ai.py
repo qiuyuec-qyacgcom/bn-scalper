@@ -13,12 +13,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+import random
 import re
+import socket
+import threading
+import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,19 +36,56 @@ ACTIONS = ("create", "update", "delete", "list")
 
 
 class AIUnavailable(RuntimeError):
-    """模型不可用（未配置 / 网络失败 / 响应不可解析）。"""
+    """模型不可用（未配置 / 网络失败 / 响应不可解析）。
+
+    `retryable` 决定这次失败是否值得重试：网络超时、429、5xx 可重试；
+    鉴权失败、请求体非法则立刻放弃——重试只会浪费时间并加剧限流。
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 # --------------------------------------------------------------------------- #
 # 配置与客户端
 # --------------------------------------------------------------------------- #
+#: 可在后台热更新的配置项（其余字段只读或由环境决定）
+TUNABLE_KEYS = (
+    "enabled",
+    "base_url",
+    "model",
+    "timeout",
+    "max_retries",
+    "retry_backoff",
+    "cache_ttl",
+    "cache_size",
+    "max_concurrency",
+    "fallback",
+    "temperature",
+)
+
+
 @dataclass(slots=True)
 class AIConfig:
+    """AI 运行时配置。
+
+    优先级：**后台设置（web.db） > 环境变量 > 默认值**。
+    后台只能改 `TUNABLE_KEYS`，密钥永远只从环境读取，不进数据库、不进接口响应。
+    """
+
     enabled: bool = False
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4o-mini"
     timeout: float = 20.0
+    max_retries: int = 2          # 失败重试次数（不含首次）
+    retry_backoff: float = 0.8    # 指数退避基数（秒）
+    cache_ttl: float = 300.0      # 结果缓存生存期（秒），0 = 关闭
+    cache_size: int = 256         # 缓存条目上限
+    max_concurrency: int = 2      # 同时在途的模型请求数
+    fallback: str = "local"       # local（降级到规则引擎）| error（直接报错）
+    temperature: float = 0.0
 
     @classmethod
     def from_env(cls) -> "AIConfig":
@@ -55,45 +98,208 @@ class AIConfig:
             api_key=key,
             model=os.environ.get("SCALPX_AI_MODEL") or "gpt-4o-mini",
             timeout=float(os.environ.get("SCALPX_AI_TIMEOUT") or 20.0),
+            max_retries=int(os.environ.get("SCALPX_AI_RETRIES") or 2),
+            retry_backoff=float(os.environ.get("SCALPX_AI_BACKOFF") or 0.8),
+            cache_ttl=float(os.environ.get("SCALPX_AI_CACHE_TTL") or 300.0),
+            cache_size=int(os.environ.get("SCALPX_AI_CACHE_SIZE") or 256),
+            max_concurrency=int(os.environ.get("SCALPX_AI_CONCURRENCY") or 2),
+            fallback=(os.environ.get("SCALPX_AI_FALLBACK") or "local").strip().lower(),
+            temperature=float(os.environ.get("SCALPX_AI_TEMPERATURE") or 0.0),
         )
+
+    # ------------------------------------------------------------------ #
+    def with_overrides(self, overrides: dict | None) -> "AIConfig":
+        """合并后台设置。非法值忽略而不是抛错——坏配置不该让后台打不开。"""
+        if not overrides:
+            return self
+        data = {f: getattr(self, f) for f in self.__slots__}  # type: ignore[attr-defined]
+        for key in TUNABLE_KEYS:
+            if key not in overrides:
+                continue
+            value = overrides[key]
+            try:
+                if key == "enabled":
+                    data[key] = bool(value)
+                elif key in ("timeout", "retry_backoff", "cache_ttl", "temperature"):
+                    data[key] = float(value)
+                elif key in ("max_retries", "cache_size", "max_concurrency"):
+                    data[key] = int(value)
+                elif key == "fallback":
+                    if str(value) not in ("local", "error"):
+                        continue
+                    data[key] = str(value)
+                else:
+                    data[key] = str(value).strip()
+            except (TypeError, ValueError):
+                continue
+
+        # 边界收敛，避免把服务拖垮
+        data["timeout"] = min(max(float(data["timeout"]), 1.0), 120.0)
+        data["max_retries"] = min(max(int(data["max_retries"]), 0), 5)
+        data["retry_backoff"] = min(max(float(data["retry_backoff"]), 0.0), 10.0)
+        data["cache_ttl"] = min(max(float(data["cache_ttl"]), 0.0), 86_400.0)
+        data["cache_size"] = min(max(int(data["cache_size"]), 0), 4096)
+        data["max_concurrency"] = min(max(int(data["max_concurrency"]), 1), 16)
+        data["temperature"] = min(max(float(data["temperature"]), 0.0), 1.0)
+        if not str(data["base_url"]).startswith(("http://", "https://")):
+            data["base_url"] = self.base_url
+        return AIConfig(**data)
 
     def describe(self) -> dict:
         return {
-            "mode": "llm" if self.enabled else "local",
+            "mode": "llm" if (self.enabled and self.api_key) else "local",
             "model": self.model if self.enabled else "",
             "base_url": self.base_url if self.enabled else "",
+            "key_configured": bool(self.api_key),
+            "timeout": self.timeout,
+            "max_retries": self.max_retries,
+            "cache_ttl": self.cache_ttl,
+            "max_concurrency": self.max_concurrency,
+            "fallback": self.fallback,
         }
 
 
+class TTLCache:
+    """极简 LRU + TTL 缓存（线程安全）。
+
+    为什么需要：同一份 schema + 同样的报错，用户在表单里反复点「AI 纠错」会打出
+    完全相同的请求。缓存把重复调用变成内存命中，既省钱也降低被限流的概率。
+    """
+
+    def __init__(self, ttl: float = 300.0, size: int = 256) -> None:
+        self.ttl = ttl
+        self.size = size
+        self._data: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
+        self._lock = threading.Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str) -> dict | None:
+        if self.ttl <= 0 or self.size <= 0:
+            return None
+        now = time.time()
+        with self._lock:
+            item = self._data.get(key)
+            if item is None:
+                self.misses += 1
+                return None
+            ts, value = item
+            if now - ts > self.ttl:
+                self._data.pop(key, None)
+                self.misses += 1
+                return None
+            self._data.move_to_end(key)
+            self.hits += 1
+            return value
+
+    def set(self, key: str, value: dict) -> None:
+        if self.ttl <= 0 or self.size <= 0:
+            return
+        with self._lock:
+            self._data[key] = (time.time(), value)
+            self._data.move_to_end(key)
+            while len(self._data) > self.size:
+                self._data.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+    def stats(self) -> dict:
+        with self._lock:
+            total = self.hits + self.misses
+            return {
+                "entries": len(self._data),
+                "hits": self.hits,
+                "misses": self.misses,
+                "hit_rate": round(self.hits / total, 3) if total else 0.0,
+            }
+
+
 class AIClient:
-    """极简 OpenAI 兼容客户端（只用标准库）。"""
+    """OpenAI 兼容客户端：超时 + 重试 + 并发闸门 + 结果缓存（只用标准库）。"""
+
+    #: 这些状态码值得重试（限流、服务端错误）
+    RETRYABLE_STATUS = (408, 409, 425, 429, 500, 502, 503, 504)
 
     def __init__(self, cfg: AIConfig) -> None:
         self.cfg = cfg
+        self.cache = TTLCache(cfg.cache_ttl, cfg.cache_size)
+        self._sem = threading.BoundedSemaphore(max(1, cfg.max_concurrency))
+        self._lock = threading.Lock()
+        self.metrics = {
+            "calls": 0, "ok": 0, "failed": 0, "retries": 0,
+            "timeouts": 0, "rate_limited": 0, "rejected_by_gate": 0,
+            "latency_ms_total": 0,
+        }
 
     @property
     def available(self) -> bool:
         return self.cfg.enabled and bool(self.cfg.api_key)
 
+    def _inc(self, key: str, delta: int = 1) -> None:
+        with self._lock:
+            self.metrics[key] = self.metrics.get(key, 0) + delta
+
+    # ------------------------------------------------------------------ #
     def chat_json(self, system: str, user: str, *, max_tokens: int = 900) -> dict:
         if not self.available:
             raise AIUnavailable("未配置模型")
-        payload = json.dumps(
-            {
-                "model": self.cfg.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0,
-                "max_tokens": max_tokens,
-                "response_format": {"type": "json_object"},
-            }
-        ).encode("utf-8")
 
+        cache_key = hashlib.sha256(
+            f"{self.cfg.model}|{self.cfg.temperature}|{max_tokens}|{system}|{user}".encode()
+        ).hexdigest()
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        payload = {
+            "model": self.cfg.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": self.cfg.temperature,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+
+        last_error: Exception | None = None
+        attempts = self.cfg.max_retries + 1
+        for attempt in range(attempts):
+            if attempt:
+                # 指数退避 + 抖动，避免多实例同时重试造成尖峰
+                delay = self.cfg.retry_backoff * (2 ** (attempt - 1))
+                time.sleep(min(delay + random.uniform(0, 0.2), 10.0))
+                self._inc("retries")
+
+            if not self._sem.acquire(timeout=self.cfg.timeout):
+                self._inc("rejected_by_gate")
+                raise AIUnavailable("模型并发已满，请稍后重试")
+
+            started = time.time()
+            try:
+                self._inc("calls")
+                result = self._post(payload)
+                self._inc("ok")
+                self._inc("latency_ms_total", int((time.time() - started) * 1000))
+                self.cache.set(cache_key, result)
+                return result
+            except AIUnavailable as exc:
+                last_error = exc
+                if not getattr(exc, "retryable", False):
+                    break
+            finally:
+                self._sem.release()
+
+        self._inc("failed")
+        raise last_error or AIUnavailable("模型调用失败")
+
+    # ------------------------------------------------------------------ #
+    def _post(self, payload: dict) -> dict:
         req = urllib.request.Request(
             f"{self.cfg.base_url}/chat/completions",
-            data=payload,
+            data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers={
                 "Authorization": f"Bearer {self.cfg.api_key}",
@@ -104,20 +310,42 @@ class AIClient:
         try:
             with urllib.request.urlopen(req, timeout=self.cfg.timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise AIUnavailable(f"模型请求失败：{exc}") from exc
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise AIUnavailable(f"鉴权失败（{exc.code}），请检查密钥", retryable=False) from exc
+            if exc.code == 429:
+                self._inc("rate_limited")
+            raise AIUnavailable(
+                f"模型返回 HTTP {exc.code}", retryable=exc.code in self.RETRYABLE_STATUS
+            ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            self._inc("timeouts")
+            raise AIUnavailable(f"模型请求超时（{self.cfg.timeout}s）", retryable=True) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise AIUnavailable(f"模型请求失败：{exc}", retryable=True) from exc
         except json.JSONDecodeError as exc:
-            raise AIUnavailable("模型响应不是合法 JSON") from exc
+            raise AIUnavailable("模型响应不是合法 JSON", retryable=True) from exc
 
         try:
             content = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError) as exc:
-            raise AIUnavailable("模型响应结构异常") from exc
+            raise AIUnavailable("模型响应结构异常", retryable=True) from exc
 
         try:
             return json.loads(content)
         except json.JSONDecodeError as exc:
-            raise AIUnavailable("模型返回内容无法解析为 JSON") from exc
+            # 输出格式抖动重试一次通常能解决
+            raise AIUnavailable("模型返回内容无法解析为 JSON", retryable=True) from exc
+
+    def stats(self) -> dict:
+        with self._lock:
+            data = dict(self.metrics)
+        calls = max(1, data["calls"])
+        return {
+            **data,
+            "avg_latency_ms": round(data["latency_ms_total"] / calls, 1),
+            "cache": self.cache.stats(),
+        }
 
 
 # --------------------------------------------------------------------------- #
@@ -352,12 +580,50 @@ def _local_explain(action: str, ok: bool, message: str, issues: list[dict], data
 # 对外门面
 # --------------------------------------------------------------------------- #
 class AIAssistant:
+    """四项能力的统一入口。持有配置与客户端，支持后台热更新。"""
+
     def __init__(self, cfg: AIConfig | None = None) -> None:
         self.cfg = cfg or AIConfig.from_env()
         self.client = AIClient(self.cfg)
+        self._lock = threading.Lock()
 
     def status(self) -> dict:
-        return self.cfg.describe()
+        return {**self.cfg.describe(), "stats": self.client.stats()}
+
+    def reload(self, overrides: dict | None) -> dict:
+        """按后台设置重建客户端（配置变了，缓存与并发闸门也要跟着重建）。"""
+        with self._lock:
+            base = AIConfig.from_env()
+            self.cfg = base.with_overrides(overrides)
+            self.client = AIClient(self.cfg)
+        log.info("AI 配置已重载：mode=%s model=%s", self.status()["mode"], self.cfg.model)
+        return self.status()
+
+    def _degrade(self, local: dict, exc: Exception, *, kind: str = "notes") -> dict:
+        """统一的降级出口。
+
+        `fallback="error"` 时把异常抛给调用方（由 api 层转成明确的错误响应），
+        适合"宁可不回答也不要给错答案"的严格场景。
+        """
+        if self.cfg.fallback == "error":
+            raise AIUnavailable(str(exc)) from exc
+        log.info("AI 回退本地规则：%s", exc)
+        out = dict(local)
+        message = f"模型不可用（{exc}），已使用本地规则"
+        if kind == "changes":
+            out["changes"] = list(local.get("changes") or []) + [
+                {"field": "-", "from": "-", "to": "-", "why": message}
+            ]
+        elif kind == "warnings":
+            out["plan"] = {
+                **local["plan"],
+                "warnings": list(local["plan"].get("warnings") or []) + [message],
+            }
+        elif kind == "none":
+            pass
+        else:
+            out["notes"] = list(local.get("notes") or []) + [message]
+        return out
 
     # ------------------------------------------------------------------ #
     def suggest(self, spec: EntitySpec, partial: dict, hint: str) -> dict:
@@ -385,8 +651,7 @@ class AIAssistant:
                 "confidence": 0.8,
             }
         except AIUnavailable as exc:
-            log.info("AI 填充回退本地规则：%s", exc)
-            return {**local, "notes": local["notes"] + [f"模型不可用（{exc}），已使用本地规则"]}
+            return self._degrade(local, exc)
 
     # ------------------------------------------------------------------ #
     def fix(self, spec: EntitySpec, payload: dict, issues: list[dict]) -> dict:
@@ -418,8 +683,7 @@ class AIAssistant:
                 "unresolved": result.get("unresolved") or [],
             }
         except AIUnavailable as exc:
-            log.info("AI 纠错回退本地规则：%s", exc)
-            return {**local, "changes": local["changes"] + [{"field": "-", "from": "-", "to": "-", "why": f"模型不可用：{exc}"}]}
+            return self._degrade(local, exc, kind="changes")
 
     # ------------------------------------------------------------------ #
     def command(self, text: str) -> dict:
@@ -464,12 +728,9 @@ class AIAssistant:
                 },
             }
         except AIUnavailable as exc:
-            log.info("AI 指令回退本地解析：%s", exc)
-            return {
-                **local,
-                "requires_confirmation": True,
-                "plan": {**local["plan"], "warnings": local["plan"]["warnings"] + [f"模型不可用（{exc}）"]},
-            }
+            degraded = self._degrade(local, exc, kind="warnings")
+            degraded["requires_confirmation"] = True
+            return degraded
 
     # ------------------------------------------------------------------ #
     def explain(self, spec: EntitySpec | None, action: str, ok: bool, message: str, issues: list[dict], data: Any) -> dict:
@@ -499,8 +760,7 @@ class AIAssistant:
                 "severity": result.get("severity") or local["severity"],
             }
         except AIUnavailable as exc:
-            log.info("AI 解读回退本地模板：%s", exc)
-            return local
+            return self._degrade(local, exc, kind="none")
 
 
 # --------------------------------------------------------------------------- #

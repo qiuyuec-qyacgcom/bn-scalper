@@ -62,10 +62,12 @@ stop_atr_mult = 2.00
 rr = 1.50
 be_at_r = 1.00
 be_offset_r = 0.10
+be_cost_buffer = true
 trail_at_r = 1.50
 trail_atr_mult = 1.20
 max_hold_bars = 30
 trend_flip_exit = true
+flow_exit_delta = 0.0        # 纸上交易先观察，熟悉后再开
 allow_long = true
 allow_short = true
 

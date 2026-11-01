@@ -8,14 +8,19 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from scalpx.web.ai import (
+    AIClient,
     AIConfig,
     AIAssistant,
+    AIUnavailable,
+    TTLCache,
     _local_command,
     _local_fix,
     _local_suggest,
@@ -276,6 +281,119 @@ class TestLocalAI(unittest.TestCase):
         self.assertEqual(out["mode"], "local")
         self.assertEqual(out["values"].get("symbol"), "BTCUSDT")
         self.assertTrue(any("本地规则" in n for n in out["notes"]))
+
+
+class TestAIConfigAndClient(unittest.TestCase):
+    """模型连接的稳定性保障：配置收敛、重试、缓存、并发、降级策略。"""
+
+    def test_overrides_clamp_and_ignore_bad_values(self) -> None:
+        base = AIConfig(enabled=False, api_key="k")
+        cfg = base.with_overrides(
+            {"timeout": 9999, "max_retries": 99, "max_concurrency": 0, "fallback": "explode", "model": " m1 "}
+        )
+        self.assertEqual(cfg.timeout, 120.0)      # 上限收敛
+        self.assertEqual(cfg.max_retries, 5)
+        self.assertEqual(cfg.max_concurrency, 1)  # 下限收敛
+        self.assertEqual(cfg.fallback, "local")   # 非法值被忽略，保留原值
+        self.assertEqual(cfg.model, "m1")         # 字符串去空白
+
+    def test_overrides_reject_bad_base_url(self) -> None:
+        base = AIConfig(base_url="https://api.example.com/v1")
+        cfg = base.with_overrides({"base_url": "file:///etc/passwd"})
+        self.assertEqual(cfg.base_url, "https://api.example.com/v1")
+
+    def test_describe_never_leaks_key(self) -> None:
+        cfg = AIConfig(enabled=True, api_key="sk-secret-value")
+        described = cfg.describe()
+        self.assertTrue(described["key_configured"])
+        self.assertNotIn("secret", json.dumps(described, ensure_ascii=False))
+
+    def test_cache_hit_avoids_second_call(self) -> None:
+        client = AIClient(AIConfig(enabled=True, api_key="k", cache_ttl=60, cache_size=8))
+        calls = {"n": 0}
+
+        def fake_post(payload):
+            calls["n"] += 1
+            return {"value": 1}
+
+        client._post = fake_post  # type: ignore[method-assign]
+        first = client.chat_json("sys", "user")
+        second = client.chat_json("sys", "user")
+        self.assertEqual(first, second)
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(client.stats()["cache"]["hits"], 1)
+
+    def test_retries_on_retryable_then_succeeds(self) -> None:
+        client = AIClient(
+            AIConfig(enabled=True, api_key="k", max_retries=2, retry_backoff=0.0, cache_ttl=0)
+        )
+        state = {"n": 0}
+
+        def flaky(payload):
+            state["n"] += 1
+            if state["n"] < 3:
+                raise AIUnavailable("网络抖动", retryable=True)
+            return {"ok": 1}
+
+        client._post = flaky  # type: ignore[method-assign]
+        self.assertEqual(client.chat_json("s", "u"), {"ok": 1})
+        self.assertEqual(state["n"], 3)
+        self.assertEqual(client.stats()["retries"], 2)
+
+    def test_no_retry_for_permanent_error(self) -> None:
+        client = AIClient(
+            AIConfig(enabled=True, api_key="k", max_retries=3, retry_backoff=0.0, cache_ttl=0)
+        )
+        state = {"n": 0}
+
+        def denied(payload):
+            state["n"] += 1
+            raise AIUnavailable("鉴权失败", retryable=False)
+
+        client._post = denied  # type: ignore[method-assign]
+        with self.assertRaises(AIUnavailable):
+            client.chat_json("s", "u")
+        self.assertEqual(state["n"], 1)  # 只尝试一次
+
+    def test_exhausted_retries_raise(self) -> None:
+        client = AIClient(
+            AIConfig(enabled=True, api_key="k", max_retries=1, retry_backoff=0.0, cache_ttl=0)
+        )
+        client._post = lambda p: (_ for _ in ()).throw(AIUnavailable("boom", retryable=True))  # type: ignore[method-assign]
+        with self.assertRaises(AIUnavailable):
+            client.chat_json("s", "u")
+        self.assertEqual(client.stats()["retries"], 1)
+
+    def test_cache_entry_expires(self) -> None:
+        cache = TTLCache(ttl=0.05, size=4)
+        cache.set("k", {"v": 1})
+        self.assertEqual(cache.get("k"), {"v": 1})
+        time.sleep(0.08)
+        self.assertIsNone(cache.get("k"))
+
+    def test_cache_respects_size(self) -> None:
+        cache = TTLCache(ttl=60, size=2)
+        cache.set("a", {})
+        cache.set("b", {})
+        cache.set("c", {})
+        self.assertEqual(cache.stats()["entries"], 2)
+
+    def test_fallback_error_mode_raises(self) -> None:
+        spec = get_entity("data_sources")
+        assert spec is not None
+        assistant = AIAssistant(
+            AIConfig(enabled=True, api_key="k", base_url="http://127.0.0.1:1",
+                     timeout=0.2, max_retries=0, fallback="error")
+        )
+        with self.assertRaises(AIUnavailable):
+            assistant.suggest(spec, {}, "symbol=BTCUSDT")
+
+    def test_reload_rebuilds_client(self) -> None:
+        assistant = AIAssistant(AIConfig(enabled=False))
+        old = assistant.client
+        status = assistant.reload({"timeout": 5, "max_retries": 1})
+        self.assertIsNot(assistant.client, old)
+        self.assertEqual(status["timeout"], 5)
 
 
 if __name__ == "__main__":

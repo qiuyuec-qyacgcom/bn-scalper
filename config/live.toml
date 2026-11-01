@@ -62,10 +62,12 @@ stop_atr_mult = 2.00
 rr = 1.50
 be_at_r = 1.00
 be_offset_r = 0.10
+be_cost_buffer = true        # 保本价覆盖往返成本
 trail_at_r = 1.50
 trail_atr_mult = 1.20
 max_hold_bars = 30
 trend_flip_exit = true
+flow_exit_delta = 0.40       # 主动盘反向占比 >= 40% 且未进移动止损区间 -> 离场
 allow_long = true
 allow_short = true
 

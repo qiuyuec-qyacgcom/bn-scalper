@@ -76,10 +76,16 @@ class TrendPullbackStrategy(Strategy):
             "rr": 1.50,
             "be_at_r": 1.00,
             "be_offset_r": 0.10,
+            # 保本价必须覆盖往返成本，否则"保本出场"其实是净亏损。
+            # True 时 be_offset 取 max(be_offset_r * risk, 往返成本 * entry)
+            "be_cost_buffer": True,
             "trail_at_r": 1.50,
             "trail_atr_mult": 1.20,
             "max_hold_bars": 30,
             "trend_flip_exit": True,
+            # 订单流反转即离场：持仓中主动卖盘（多头）超过该阈值就撤。
+            # 0 = 关闭；0.35 表示"反向主动成交占比超过 35%"
+            "flow_exit_delta": 0.0,
             # --- 方向 ---
             "allow_long": True,
             "allow_short": True,
@@ -107,6 +113,10 @@ class TrendPullbackStrategy(Strategy):
             raise ValueError("max_absorption 必须在 [0,1]")
         if not -1.0 <= p["min_obi"] <= 1.0:
             raise ValueError("min_obi 必须在 [-1,1]")
+        if not 0.0 <= p["flow_exit_delta"] <= 1.0:
+            raise ValueError("flow_exit_delta 必须在 [0,1]")
+        if p["be_offset_r"] < 0:
+            raise ValueError("be_offset_r 不能为负")
         if not -1.0 <= p["min_stack_score"] <= 1.0:
             raise ValueError("min_stack_score 必须在 [-1,1]")
         # 兼容旧配置：require_flow=false 等价于关闭订单流过滤
@@ -356,17 +366,36 @@ class TrendPullbackStrategy(Strategy):
         if risk <= 0:
             return []
 
-        # X3 保本
+        # X3 保本（含成本缓冲）
         if not pos.breakeven_moved and r >= p["be_at_r"]:
+            offset = p["be_offset_r"] * risk
+            if p["be_cost_buffer"]:
+                # 往返手续费 + 滑点折算成价格；否则"保本价"成交后仍是小额亏损
+                cost_bps = float(ctx.extras.get("cost_bps", 0.0) or 0.0)
+                offset = max(offset, pos.entry_price * cost_bps / 10_000.0)
             if pos.side is PositionSide.LONG:
-                new_stop = pos.entry_price + p["be_offset_r"] * risk
+                new_stop = pos.entry_price + offset
             else:
-                new_stop = pos.entry_price - p["be_offset_r"] * risk
+                new_stop = pos.entry_price - offset
             out.append(
                 AdjustStopIntent(
                     symbol=bar.symbol, ts=bar.ts, new_stop=new_stop, reason=ExitReason.TRAILING_STOP
                 )
             )
+
+        # X7 订单流反转离场：微观结构先于价格结构变化，用来抢在 EMA 翻转之前走
+        if p["flow_exit_delta"] > 0 and ctx.flow is not None and ctx.flow.has_data:
+            delta = ctx.flow.delta_ratio
+            adverse = -delta if pos.side is PositionSide.LONG else delta
+            if adverse >= p["flow_exit_delta"] and r < p["trail_at_r"]:
+                return [
+                    ExitIntent(
+                        symbol=bar.symbol,
+                        ts=bar.ts,
+                        reason=ExitReason.FLOW_REVERSAL,
+                        ref_price=price,
+                    )
+                ]
 
         # X4 移动止损
         if r >= p["trail_at_r"] and atr > 0:

@@ -33,7 +33,7 @@ from .auth import (
     issue_token,
     verify_password,
 )
-from .ai import AIAssistant, validate_plan
+from .ai import TUNABLE_KEYS, AIAssistant, AIUnavailable, validate_plan
 from .generic import EntityError, EntityStore
 from .instruments import (
     canonical_key,
@@ -146,6 +146,9 @@ ROUTES: list[Route] = [
     ("PATCH", re.compile(r"^/api/admin/entities/(?P<entity>[a-z_]+)/(?P<rid>\d+)$"), "entities_update", (ROLE_ADMIN,)),
     ("DELETE", re.compile(r"^/api/admin/entities/(?P<entity>[a-z_]+)/(?P<rid>\d+)$"), "entities_delete", (ROLE_ADMIN,)),
     # --- AI 辅助 ---
+    ("GET", re.compile(r"^/api/admin/ai/config$"), "ai_config", (ROLE_ADMIN,)),
+    ("PUT", re.compile(r"^/api/admin/ai/config$"), "ai_config_update", (ROLE_ADMIN,)),
+    ("POST", re.compile(r"^/api/admin/ai/cache/clear$"), "ai_cache_clear", (ROLE_ADMIN,)),
     ("POST", re.compile(r"^/api/admin/ai/suggest$"), "ai_suggest", (ROLE_ADMIN,)),
     ("POST", re.compile(r"^/api/admin/ai/fix$"), "ai_fix", (ROLE_ADMIN,)),
     ("POST", re.compile(r"^/api/admin/ai/command$"), "ai_command", (ROLE_ADMIN,)),
@@ -194,7 +197,9 @@ class Api:
         self.config_dir = self.root / "config"
         self.kill_file = self.root / "data" / "KILL"
         self.store = EntityStore(web)
+        # AI：环境变量打底，后台设置覆盖（密钥永远只来自环境）
         self.ai = AIAssistant()
+        self.ai.reload(web.get_setting("ai_config", {}))
         self._register_dynamic_options()
 
     def _register_dynamic_options(self) -> None:
@@ -778,7 +783,7 @@ class Api:
                 invalid += 1
                 results.append({
                     "line": index, "code": code, "status": "invalid",
-                    "issues": [i.as_dict() for i in result.issues],
+                    "issues": [i.as_dict() for i in result.issues], "row": raw,
                 })
                 continue
 
@@ -790,6 +795,7 @@ class Api:
                     "line": index, "code": result.data["code"], "status": "duplicate",
                     "existing_id": existing["id"] if existing else None,
                     "message": "本批内重复" if key in seen else "已存在于标的库",
+                    "row": raw,
                 })
                 continue
 
@@ -798,19 +804,27 @@ class Api:
             created += 1
             results.append({
                 "line": index, "code": result.data["code"], "name": result.data["name"],
-                "status": "created", "id": iid,
+                "status": "created", "id": iid, "row": raw,
             })
 
         self.web.audit(
             uid=p.uid, username=p.username, action="instrument_import",
             target=f"{created} created / {duplicated} dup / {invalid} invalid", ip=req.ip,
         )
+        # `retry_rows` 直接回喂给同一接口即可重试（前端「重试失败行」用它），
+        # 保证"部分成功"的批量导入不需要用户手工挑行。
+        retry_rows = [
+            item["row"] for item in results
+            if item["status"] == "invalid" and isinstance(item.get("row"), dict)
+        ]
         return {
             "total": len(rows),
             "created": created,
             "duplicated": duplicated,
             "invalid": invalid,
+            "failed": duplicated + invalid,
             "items": results,
+            "retry_rows": retry_rows,
         }
 
     def _execute_backtest(
@@ -1224,6 +1238,50 @@ class Api:
         key = str(req.body.get("entity") or "")
         return get_entity(key)
 
+    def _ai_guard(self, fn):
+        """把模型不可用转成 503，并保留可读原因；其余异常照常冒泡。"""
+        try:
+            return fn()
+        except AIUnavailable as exc:
+            raise ApiError("AI_UNAVAILABLE", str(exc), 503) from exc
+
+    def h_ai_config(self, req: Request) -> dict:
+        return {
+            "config": self.ai.cfg.describe(),
+            "tunables": list(TUNABLE_KEYS),
+            "stats": self.ai.client.stats(),
+            "overrides": self.web.get_setting("ai_config", {}) or {},
+        }
+
+    def h_ai_config_update(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        body = req.body.get("config") if isinstance(req.body.get("config"), dict) else req.body
+        if not isinstance(body, dict):
+            raise ApiError("BAD_REQUEST", "config 必须是对象", 400)
+
+        unknown = [k for k in body if k not in TUNABLE_KEYS]
+        if unknown:
+            raise ApiError("BAD_REQUEST", f"不可修改的配置项：{', '.join(unknown)}", 400)
+        if not body:
+            raise ApiError("BAD_REQUEST", "没有需要更新的配置项", 400)
+
+        merged = {**(self.web.get_setting("ai_config", {}) or {}), **body}
+        status = self.ai.reload(merged)
+        self.web.set_setting("ai_config", merged)
+        self.web.audit(
+            uid=p.uid, username=p.username, action="ai_config_update",
+            target=",".join(sorted(body)), detail=json.dumps(body, ensure_ascii=False)[:200], ip=req.ip,
+        )
+        return {"config": status, "overrides": merged}
+
+    def h_ai_cache_clear(self, req: Request) -> dict:
+        p = req.principal
+        assert p is not None
+        self.ai.client.cache.clear()
+        self.web.audit(uid=p.uid, username=p.username, action="ai_cache_clear", target="ai", ip=req.ip)
+        return {"cleared": True, "stats": self.ai.client.stats()}
+
     def h_ai_suggest(self, req: Request) -> dict:
         spec = self._entity_for(req)
         if spec is None:
@@ -1231,7 +1289,9 @@ class Api:
         partial = req.body.get("partial") or {}
         if not isinstance(partial, dict):
             raise ApiError("BAD_REQUEST", "partial 必须是对象")
-        return self.ai.suggest(spec, partial, str(req.body.get("hint") or ""))
+        return self._ai_guard(
+            lambda: self.ai.suggest(spec, partial, str(req.body.get("hint") or ""))
+        )
 
     def h_ai_fix(self, req: Request) -> dict:
         spec = self._entity_for(req)
@@ -1243,7 +1303,7 @@ class Api:
         issues = self.store.validate(spec, payload)["issues"]
         if not issues:
             return {"mode": self.ai.status()["mode"], "payload": payload, "changes": [], "unresolved": []}
-        return self.ai.fix(spec, payload, issues)
+        return self._ai_guard(lambda: self.ai.fix(spec, payload, issues))
 
     def h_ai_command(self, req: Request) -> dict:
         text = str(req.body.get("text") or "").strip()
@@ -1251,7 +1311,7 @@ class Api:
             raise ApiError("BAD_REQUEST", "请输入指令", 400)
         if len(text) > 500:
             raise ApiError("BAD_REQUEST", "指令过长（上限 500 字）", 400)
-        result = self.ai.command(text)
+        result = self._ai_guard(lambda: self.ai.command(text))
         plan = result.get("plan") or {}
         # 预览：把计划跑一遍 schema 校验，让用户在确认前就看到会不会失败
         _, issues = validate_plan(plan)
@@ -1314,7 +1374,9 @@ class Api:
         data = req.body.get("data")
         if not isinstance(issues, list):
             issues = []
-        return self.ai.explain(spec, action, ok, message, issues, data)
+        return self._ai_guard(
+            lambda: self.ai.explain(spec, action, ok, message, issues, data)
+        )
 
     def h_run_delete(self, req: Request) -> dict:
         p = req.principal

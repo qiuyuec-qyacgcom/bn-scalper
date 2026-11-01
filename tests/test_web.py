@@ -555,9 +555,64 @@ class TestGenericAdmin(WebTestCase):
         self.assertEqual(payload["data"]["severity"], "error")
         self.assertTrue(payload["data"]["suggestions"])
 
+    def test_ai_config_read_and_update(self) -> None:
+        status, payload = self.call_api("GET", "/api/admin/ai/config")
+        self.assertEqual(status, 200, payload)
+        self.assertIn("tunables", payload["data"])
+        self.assertIn("stats", payload["data"])
+        self.assertNotIn("api_key", payload["data"]["config"])
+
+        status, payload = self.call_api(
+            "PUT", "/api/admin/ai/config", {"config": {"timeout": 9, "max_retries": 1}}
+        )
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["data"]["config"]["timeout"], 9)
+        self.assertEqual(payload["data"]["config"]["max_retries"], 1)
+
+        # 已持久化：再次读取仍然是新值
+        _, payload = self.call_api("GET", "/api/admin/ai/config")
+        self.assertEqual(payload["data"]["overrides"]["timeout"], 9)
+
+    def test_ai_config_rejects_unknown_key(self) -> None:
+        status, payload = self.call_api(
+            "PUT", "/api/admin/ai/config", {"config": {"api_key": "leak"}}
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["error"]["code"], "BAD_REQUEST")
+
+    def test_ai_cache_clear(self) -> None:
+        status, payload = self.call_api("POST", "/api/admin/ai/cache/clear")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["data"]["cleared"])
+
+    def test_batch_reports_retry_rows(self) -> None:
+        """部分成功的批量导入必须回传可重试的行，前端才能"一键重试失败行"。"""
+        rows = [
+            {"code": "RETRYOK", "name": "可成功", "asset_type": "crypto"},
+            {"code": "BAD", "name": "非法代码", "asset_type": "stock", "market": "SH"},
+            {"code": "RETRYOK", "name": "批内重复", "asset_type": "crypto"},
+        ]
+        status, payload = self.call_api("POST", "/api/admin/instruments/batch", {"rows": rows})
+        self.assertEqual(status, 200, payload)
+        data = payload["data"]
+        self.assertEqual(data["created"], 1, payload)
+        self.assertEqual(data["duplicated"], 1)
+        self.assertEqual(data["invalid"], 1)
+        self.assertEqual(data["failed"], 2)
+        self.assertEqual(len(data["retry_rows"]), 1)
+        self.assertEqual(data["retry_rows"][0]["code"], "BAD")
+
+        # 清理，避免影响同一测试类里的其它用例
+        _, listing = self.call_api("GET", "/api/instruments")
+        for item in listing["data"]["items"]:
+            if item["code"] == "RETRYOK":
+                self.call_api("DELETE", f"/api/admin/instruments/{item['id']}")
+
     def test_non_admin_blocked(self) -> None:
         user_token = self.login("alice", "user-pass-123")
         status, _ = self.call("GET", "/api/admin/entities", token=user_token)
+        self.assertEqual(status, 403)
+        status, _ = self.call("GET", "/api/admin/ai/config", token=user_token)
         self.assertEqual(status, 403)
 
 

@@ -257,6 +257,129 @@ class TestBookQuality(unittest.TestCase):
             self.assertIn(key, desc)
 
 
+class TestExitImprovements(unittest.TestCase):
+    """出场逻辑两处优化：保本价计入成本、订单流反转离场。"""
+
+    def _pos(self, *, entry=100.0, stop=99.0, side=None, bars_held=1):
+        from scalpx.models import Position, PositionSide
+
+        side = side or PositionSide.LONG
+        return Position(
+            symbol="BTCUSDT", side=side, qty=1.0, entry_price=entry, entry_ts=0,
+            stop_price=stop, take_profit_price=entry + 2, initial_stop=stop,
+            bars_held=bars_held,
+        )
+
+    def _ctx(self, *, price, position, flow=None, extras=None):
+        from collections import deque
+
+        from scalpx.indicators import IndicatorSet, Snapshot
+        from scalpx.models import Bar
+        from scalpx.strategy.base import StrategyContext
+
+        bar = Bar(symbol="BTCUSDT", ts=0, open=price, high=price, low=price, close=price, volume=10)
+        snap = Snapshot(
+            symbol="BTCUSDT", ts=0, close=price, atr=1.0, ema_fast=99.0, ema_slow=98.0,
+            ema_trend=97.0, trend_slope_pct=0.001, rsi=55.0, rsi_prev=45.0,
+            vol_sma=5.0, volume_ratio=1.5, atr_pct=0.01, taker_buy_ratio=None, bars_seen=500,
+        )
+        return StrategyContext(
+            bar=bar, snapshot=snap, history=deque([bar]), indicators=IndicatorSet(),
+            position=position, equity=10_000, ts=0, flow=flow, extras=extras or {},
+        )
+
+    def _strategy(self, **params):
+        from scalpx.strategy.trend_pullback import TrendPullbackStrategy
+
+        return TrendPullbackStrategy(params)
+
+    # ---------------- 保本价必须覆盖成本 ----------------
+    def test_breakeven_includes_cost_buffer(self) -> None:
+        from scalpx.models import AdjustStopIntent
+
+        s = self._strategy(be_at_r=1.0, be_offset_r=0.01, be_cost_buffer=True, trail_at_r=99)
+        ctx = self._ctx(price=101.0, position=self._pos(), extras={"cost_bps": 7.0})
+        intents = s._manage(ctx)
+        adjust = [i for i in intents if isinstance(i, AdjustStopIntent)]
+        self.assertEqual(len(adjust), 1)
+        # 0.01R(0.01) 与 7bps(0.07) 取大 -> 100.07
+        self.assertAlmostEqual(adjust[0].new_stop, 100.07, places=4)
+
+    def test_breakeven_offset_wins_when_larger(self) -> None:
+        from scalpx.models import AdjustStopIntent
+
+        s = self._strategy(be_at_r=1.0, be_offset_r=0.1, be_cost_buffer=True, trail_at_r=99)
+        ctx = self._ctx(price=101.0, position=self._pos(), extras={"cost_bps": 7.0})
+        adjust = [i for i in s._manage(ctx) if isinstance(i, AdjustStopIntent)]
+        self.assertAlmostEqual(adjust[0].new_stop, 100.1, places=4)
+
+    def test_breakeven_without_buffer_uses_raw_offset(self) -> None:
+        from scalpx.models import AdjustStopIntent
+
+        s = self._strategy(be_at_r=1.0, be_offset_r=0.01, be_cost_buffer=False, trail_at_r=99)
+        ctx = self._ctx(price=101.0, position=self._pos(), extras={"cost_bps": 7.0})
+        adjust = [i for i in s._manage(ctx) if isinstance(i, AdjustStopIntent)]
+        self.assertAlmostEqual(adjust[0].new_stop, 100.01, places=4)
+
+    def test_short_breakeven_is_mirrored(self) -> None:
+        from scalpx.models import AdjustStopIntent, PositionSide
+
+        s = self._strategy(be_at_r=1.0, be_offset_r=0.01, be_cost_buffer=True, trail_at_r=99)
+        pos = self._pos(entry=100.0, stop=101.0, side=PositionSide.SHORT)
+        ctx = self._ctx(price=99.0, position=pos, extras={"cost_bps": 7.0})
+        adjust = [i for i in s._manage(ctx) if isinstance(i, AdjustStopIntent)]
+        self.assertAlmostEqual(adjust[0].new_stop, 99.93, places=4)
+
+    # ---------------- 订单流反转离场 ----------------
+    def _flow(self, delta_ratio):
+        from scalpx.models import FlowSnapshot
+
+        return FlowSnapshot(
+            symbol="BTCUSDT", ts=0, buy_vol=50, sell_vol=50, trades=100, delta=delta_ratio * 100,
+            delta_ratio=delta_ratio, cvd=0.0, cvd_slope=0.0, absorption=0.1,
+        )
+
+    def test_flow_reversal_exits_long(self) -> None:
+        from scalpx.models import ExitReason, ExitIntent
+
+        s = self._strategy(flow_exit_delta=0.35, trend_flip_exit=False)
+        ctx = self._ctx(price=100.5, position=self._pos(), flow=self._flow(-0.5))
+        exits = [i for i in s._manage(ctx) if isinstance(i, ExitIntent)]
+        self.assertEqual(len(exits), 1)
+        self.assertIs(exits[0].reason, ExitReason.FLOW_REVERSAL)
+
+    def test_flow_reversal_mirrored_for_short(self) -> None:
+        from scalpx.models import ExitIntent, PositionSide
+
+        s = self._strategy(flow_exit_delta=0.35, trend_flip_exit=False)
+        pos = self._pos(entry=100.0, stop=101.0, side=PositionSide.SHORT)
+        ctx = self._ctx(price=99.5, position=pos, flow=self._flow(0.5))
+        exits = [i for i in s._manage(ctx) if isinstance(i, ExitIntent)]
+        self.assertEqual(len(exits), 1)
+
+    def test_flow_reversal_off_by_default(self) -> None:
+        from scalpx.models import ExitIntent
+
+        s = self._strategy()
+        ctx = self._ctx(price=100.5, position=self._pos(), flow=self._flow(-0.9))
+        self.assertEqual([i for i in s._manage(ctx) if isinstance(i, ExitIntent)], [])
+
+    def test_flow_reversal_yields_to_trailing_zone(self) -> None:
+        """已经进入移动止损区间时，交给移动止损，不抢跑。"""
+        from scalpx.models import ExitIntent
+
+        s = self._strategy(flow_exit_delta=0.35, trend_flip_exit=False, trail_at_r=1.5)
+        ctx = self._ctx(price=102.0, position=self._pos(), flow=self._flow(-0.9))
+        self.assertEqual([i for i in s._manage(ctx) if isinstance(i, ExitIntent)], [])
+
+    def test_no_flow_data_is_ignored(self) -> None:
+        from scalpx.models import ExitIntent
+
+        s = self._strategy(flow_exit_delta=0.35, trend_flip_exit=False)
+        ctx = self._ctx(price=100.5, position=self._pos(), flow=None)
+        self.assertEqual([i for i in s._manage(ctx) if isinstance(i, ExitIntent)], [])
+
+
 class TestStrategyDegradation(unittest.TestCase):
     """策略必须在"有数据/无数据/强制模式"三种情况下行为可预测。"""
 

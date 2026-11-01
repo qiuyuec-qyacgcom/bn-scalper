@@ -109,6 +109,19 @@ class BacktestEngine:
         self._micro_bars_with_flow = 0
         self._micro_bars_with_book = 0
 
+        # 往返成本（bps）：策略用它在保本价上计入手续费，避免"保本出场仍亏钱"
+        try:
+            from ..risk.costs import round_trip_cost
+
+            self._cost_bps = round_trip_cost(
+                cfg.execution,
+                entry_is_maker=cfg.execution.entry_order_type != "market",
+                exit_is_maker=False,
+                spread_bps=cfg.backtest.assumed_spread_bps,
+            ).as_bps()
+        except Exception:  # noqa: BLE001 - 成本模型异常不应阻断回测
+            self._cost_bps = 0.0
+
         self.portfolio = Portfolio(initial_equity=cfg.backtest.initial_equity)
         self.broker = SimulatedBroker(
             cfg.market, cfg.execution, pessimistic_intrabar=cfg.backtest.pessimistic_intrabar
@@ -310,6 +323,7 @@ class BacktestEngine:
                 ts=bar.ts_close,
                 flow=flow,
                 book=book,
+                extras={"cost_bps": self._cost_bps},
             )
             for intent in self.strategy.on_bar(ctx):
                 self._dispatch(intent, snapshot, bar, equity)

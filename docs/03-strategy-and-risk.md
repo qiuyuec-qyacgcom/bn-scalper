@@ -119,7 +119,7 @@ side = +1  if bid_qty/ask_qty >= stack_ratio
 |---|---|---|---|
 | X1 | 初始止损 `entry ∓ stop_atr_mult·ATR`，再被夹到 `[min_stop_pct, max_stop_pct]` | `stop_atr_mult=2.0`, `0.4%~0.8%` | 风控 sizing 夹紧 → 交易所 `STOP_MARKET` |
 | X2 | 止盈 `entry ± rr·实际止损距离` | `rr=1.5` | 交易所 `TAKE_PROFIT_MARKET` |
-| X3 | 浮盈 ≥ 1.0R 时止损推到 `entry ± 0.1R`（保本） | `be_at_r=1.0`, `be_offset_r=0.1` | 策略 → OMS 撤旧挂新 |
+| X3 | 浮盈 ≥ 1.0R 时止损推到保本（**含成本缓冲**） | `be_at_r=1.0`, `be_offset_r=0.1`, `be_cost_buffer=true` | 策略 → OMS 撤旧挂新 |
 | X4 | 浮盈 ≥ 1.5R 后按 `close ∓ 1.2·ATR` 跟踪 | `trail_at_r=1.5`, `trail_atr_mult=1.2` | 同上（单调收紧） |
 | X5 | 持仓 ≥ 30 根且浮盈 < 0.5R → 平仓 | `max_hold_bars=30` | 策略 |
 | X6 | `EMA_f` 反向穿越 `EMA_s` 且浮盈 < 1R → 平仓 | `trend_flip_exit=true` | 策略 |
@@ -166,6 +166,16 @@ qty           = floor_step(min(qty_risk, qty_cap), qty_step)
 | `LEVERAGE_CAP` | 剩余杠杆空间不足 | 上限 3x |
 | `NO_LIQUIDITY` | 当根无成交量 | — |
 | `COST_TOO_HIGH` | 往返成本 / 止损距离 超限 | `max_cost_ratio=0.35`（即手续费最多吃掉 0.35R） |
+
+**保本价为什么要含成本缓冲**：若保本价恰好等于开仓价，"保本出场"实际是**净亏损**
+（进场 + 出场两次手续费与滑点）。`be_cost_buffer=true` 时偏移取
+`max(be_offset_r × risk, 往返成本 × entry)`，引擎把 `cost_bps` 放进
+`StrategyContext.extras` 传入策略。默认开启，可用 `be_cost_buffer=false` 关闭。
+
+**X7 订单流反转离场**（`flow_exit_delta > 0` 时启用）：持仓中若反向主动成交占比
+达到阈值且尚未进入移动止损区间（`r < trail_at_r`），直接以 `flow_reversal` 平仓。
+微观结构通常先于价格结构（EMA 翻转）变化，这条规则用于抢在结构确认之前离场。
+默认关闭（0），可在 `paper.toml` / `live.toml` 开启。
 | `BOOK_UNTRUSTED` | 盘口数据劣化（丢包/乱序/过期比例超阈值） | `max_bad_ratio=0.5`，仅当策略依赖盘口时生效 |
 | `SIZE_TOO_SMALL` / `NOTIONAL_TOO_SMALL` | 仓位过小 | 交易所最小额 |
 

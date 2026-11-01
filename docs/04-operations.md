@@ -160,6 +160,20 @@ python -m scalpx live --config config/live.toml --i-understand-live-risk
 | `symbol_cooldown_bars` | 3 | 出场后同标的冷却 |
 | `correlated_risk_factor` | 1.5 | 同向持仓的风险折算系数 |
 | `max_cost_ratio` | 0.35 | 往返成本 / 止损距离 上限；超限拒绝 `COST_TOO_HIGH`。设 0 关闭 |
+| `be_cost_buffer` | `true` | 保本价计入往返成本，避免"保本出场仍亏手续费" |
+| `flow_exit_delta` | 0.0 | >0 时订单流反向占比达阈值即离场（`flow_reversal`）；0 关闭 |
+
+### AI 运行参数
+
+| 来源 | 键 | 默认 | 说明 |
+|---|---|---|---|
+| 环境 | `SCALPX_AI_KEY` | 空 | 配置即启用大模型；不配则本地规则模式 |
+| 环境 | `SCALPX_AI_BASE_URL` / `SCALPX_AI_MODEL` | OpenAI / gpt-4o-mini | 兼容 OpenAI 协议 |
+| 环境 | `SCALPX_AI_RETRIES` | 2 | 失败重试次数（仅对超时/429/5xx 重试） |
+| 环境 | `SCALPX_AI_CACHE_TTL` | 300 | 结果缓存秒数，0 关闭 |
+| 环境 | `SCALPX_AI_CONCURRENCY` | 2 | 同时在途请求上限 |
+| 环境 | `SCALPX_AI_FALLBACK` | `local` | `local` 降级规则 / `error` 严格报错 |
+| 后台 | `/api/admin/ai/config` | — | 在线调整上述可调项（密钥不可写），即时生效 |
 
 ### `[execution]`
 

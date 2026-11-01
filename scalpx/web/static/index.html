@@ -95,13 +95,15 @@
 
       <!-- 交易明细 -->
       <section class="view" id="view-trades">
-        <div class="toolbar">
-          <div class="field" style="width:200px"><label>标的</label>
-            <input id="tradeSymbol" type="text" list="instrumentList" placeholder="全部（如 BTCUSDT）" /></div>
-          <div class="field" style="width:140px"><label>每页</label>
-            <select id="tradeLimit"><option>50</option><option>100</option><option>200</option></select></div>
-          <div class="grow"></div>
-          <button class="btn" id="tradeQuery" style="align-self:flex-end">查询</button>
+        <div class="card" style="padding:14px 16px;margin-bottom:14px">
+          <div class="toolbar" style="margin-bottom:0">
+            <div class="field" style="width:200px"><label>标的</label>
+              <input id="tradeSymbol" type="text" list="instrumentList" placeholder="全部（如 BTCUSDT）" /></div>
+            <div class="field" style="width:140px"><label>每页</label>
+              <select id="tradeLimit"><option>50</option><option>100</option><option>200</option></select></div>
+            <div class="grow"></div>
+            <button class="btn" id="tradeQuery">查询</button>
+          </div>
         </div>
         <div class="card pad0"><div class="table-wrap"><table id="tradeTable"></table></div>
           <div class="card-body" style="padding-top:10px"><span class="dim" id="tradePager"></span></div>
