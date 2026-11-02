@@ -242,12 +242,21 @@ class AIClient:
             self.metrics[key] = self.metrics.get(key, 0) + delta
 
     # ------------------------------------------------------------------ #
-    def chat_json(self, system: str, user: str, *, max_tokens: int = 900) -> dict:
+    def chat_json(
+        self, system: str, user: str, *, max_tokens: int = 900, scope: str = ""
+    ) -> dict:
+        """调用模型并解析 JSON。
+
+        `scope` 是**缓存作用域**：凡提示词里包含"某个用户才能看到的数据"，
+        调用方必须传入该用户标识（本项目传 `u<uid>`），否则 A 的命中结果会被
+        回填给 B——这是静默的数据越界，不会报错。提示词确实与用户无关时
+        才允许留空，此时多个用户共享缓存（命中率更高）。
+        """
         if not self.available:
             raise AIUnavailable("未配置模型")
 
         cache_key = hashlib.sha256(
-            f"{self.cfg.model}|{self.cfg.temperature}|{max_tokens}|{system}|{user}".encode()
+            f"{scope}|{self.cfg.model}|{self.cfg.temperature}|{max_tokens}|{system}|{user}".encode()
         ).hexdigest()
         cached = self.cache.get(cache_key)
         if cached is not None:
@@ -626,7 +635,7 @@ class AIAssistant:
         return out
 
     # ------------------------------------------------------------------ #
-    def suggest(self, spec: EntitySpec, partial: dict, hint: str) -> dict:
+    def suggest(self, spec: EntitySpec, partial: dict, hint: str, *, scope: str = "") -> dict:
         local = _local_suggest(spec, partial, hint)
         if not self.client.available:
             return local
@@ -636,6 +645,7 @@ class AIAssistant:
                 '{"values": {字段名: 值}, "notes": ["说明"]}。'
                 "不要编造无法从描述推断的值；不确定就不要填。",
                 json.dumps({"schema": _schema_digest(spec), "current": partial, "hint": hint}, ensure_ascii=False),
+                scope=scope,
             )
             values = result.get("values") or {}
             if not isinstance(values, dict):
@@ -654,7 +664,7 @@ class AIAssistant:
             return self._degrade(local, exc)
 
     # ------------------------------------------------------------------ #
-    def fix(self, spec: EntitySpec, payload: dict, issues: list[dict]) -> dict:
+    def fix(self, spec: EntitySpec, payload: dict, issues: list[dict], *, scope: str = "") -> dict:
         local = _local_fix(spec, payload, issues)
         if not self.client.available:
             return local
@@ -671,6 +681,7 @@ class AIAssistant:
                     },
                     ensure_ascii=False,
                 ),
+                scope=scope,
             )
             fixed = result.get("payload")
             if not isinstance(fixed, dict):
@@ -686,7 +697,7 @@ class AIAssistant:
             return self._degrade(local, exc, kind="changes")
 
     # ------------------------------------------------------------------ #
-    def command(self, text: str) -> dict:
+    def command(self, text: str, *, scope: str = "") -> dict:
         local = _local_command(text)
         if not self.client.available:
             return {**local, "requires_confirmation": True}
@@ -697,6 +708,7 @@ class AIAssistant:
                 '"data":{字段:值},"summary":"一句话说明你会做什么","warnings":["风险提示"]}。'
                 "entity 必须来自给定列表；无法确定时 entity 留空并在 warnings 说明。",
                 json.dumps({"entities": _all_digests(), "text": text}, ensure_ascii=False),
+                scope=scope,
             )
             entity = str(result.get("entity") or "")
             action = str(result.get("action") or "")
@@ -733,7 +745,17 @@ class AIAssistant:
             return degraded
 
     # ------------------------------------------------------------------ #
-    def explain(self, spec: EntitySpec | None, action: str, ok: bool, message: str, issues: list[dict], data: Any) -> dict:
+    def explain(
+        self,
+        spec: EntitySpec | None,
+        action: str,
+        ok: bool,
+        message: str,
+        issues: list[dict],
+        data: Any,
+        *,
+        scope: str = "",
+    ) -> dict:
         local = _local_explain(action, ok, message, issues, data)
         if not self.client.available:
             return local
@@ -752,6 +774,7 @@ class AIAssistant:
                     },
                     ensure_ascii=False,
                 ),
+                scope=scope,
             )
             return {
                 "mode": "llm",

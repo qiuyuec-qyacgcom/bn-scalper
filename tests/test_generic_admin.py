@@ -364,6 +364,33 @@ class TestAIConfigAndClient(unittest.TestCase):
             client.chat_json("s", "u")
         self.assertEqual(client.stats()["retries"], 1)
 
+    def test_cache_scope_isolates_users(self) -> None:
+        """同样的提示词、不同用户 -> 必须各自调用，不能互相命中。"""
+        client = AIClient(AIConfig(enabled=True, api_key="k", cache_ttl=60, cache_size=16))
+        calls = {"n": 0}
+
+        def fake_post(payload):
+            calls["n"] += 1
+            return {"n": calls["n"]}
+
+        client._post = fake_post  # type: ignore[method-assign]
+        a1 = client.chat_json("sys", "same prompt", scope="u1")
+        a2 = client.chat_json("sys", "same prompt", scope="u1")
+        b1 = client.chat_json("sys", "same prompt", scope="u2")
+        self.assertEqual(a1, a2)          # 同一用户命中缓存
+        self.assertNotEqual(a1, b1)       # 跨用户不复用
+        self.assertEqual(calls["n"], 2)
+
+    def test_cache_scope_empty_is_shared(self) -> None:
+        """显式留空表示提示词与用户无关，此时共享缓存提高命中率。"""
+        client = AIClient(AIConfig(enabled=True, api_key="k", cache_ttl=60, cache_size=16))
+        calls = {"n": 0}
+        client._post = lambda p: {"n": calls.__setitem__("n", calls["n"] + 1) or {"n": calls["n"]}}  # type: ignore[method-assign]
+        first = client.chat_json("sys", "shared")
+        second = client.chat_json("sys", "shared")
+        self.assertEqual(first, second)
+        self.assertEqual(calls["n"], 1)
+
     def test_cache_entry_expires(self) -> None:
         cache = TTLCache(ttl=0.05, size=4)
         cache.set("k", {"v": 1})

@@ -300,7 +300,7 @@ scalpx/
 ├── config/                     # backtest.toml / paper.toml / live.toml
 ├── deploy/                     # install.sh / uninstall.sh / healthcheck.sh / README.md
 ├── docs/                       # 01 调研 · 02 架构 · 03 策略风控 · 04 运维 · 05 代码评审 · 06 Web · 07 后台与 AI
-├── scripts/                    # make_sample_data.py / grid_search.py / publish.sh
+├── scripts/                    # make_sample_data.py / grid_search.py / ui_smoke.py / publish.sh
 ├── tests/                      # 198 个用例
 ├── pyproject.toml
 ├── LICENSE
@@ -377,14 +377,24 @@ BTCUSDT 1m × 30 天，1 万 U 初始权益，maker 2bps / taker 4bps：
 ## 测试
 
 ```bash
+# 单元 / 接口测试
 python -m unittest discover -s tests -t . -v
+
+# 浏览器冒烟（需要本机有 Chrome/Edge；零依赖，走 DevTools 协议）
+python scripts/ui_smoke.py
 ```
 
-当前 **198 个用例**，覆盖：指标口径、撮合语义、保护单不变量、成本闸门、微观结构
-（CVD/OBI/堆叠/质量熔断）、schema 校验、权限与接口契约、安装脚本幂等性。
+当前 **200+ 个用例**，覆盖：指标口径、撮合语义、保护单不变量、成本闸门、微观结构
+（CVD/OBI/堆叠/质量熔断）、schema 校验、权限与接口契约、AI 缓存作用域与重试。
 
 其中 `tests/test_system.py::TestArchitecture` 用 AST 静态检查**依赖方向**——
 策略层一旦 import 执行层立刻失败。解耦不靠约定，靠测试。
+
+`ui_smoke.py` 补的是静态检查抓不到的一类问题：真实打开 `/admin` 与 `/`，
+逐个点击 9 个导航、开关一次弹窗、检查关键节点，并收集 `console.error` /
+未捕获异常 / 4xx-5xx 响应。它上线第一次运行就发现 `/static/*` 全部 404
+（`static/app.css` 被拼成 `static/static/app.css`）——页面能返回 200，
+但样式与脚本全没加载。
 
 ---
 

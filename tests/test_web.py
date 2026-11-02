@@ -631,6 +631,20 @@ class TestStatic(WebTestCase):
         self.assertEqual(resp.status, 200)
         self.assertIn("管理", body)
 
+    def test_static_assets_served(self) -> None:
+        """页面引用的是 /static/xxx，必须真的能取到（曾经拼成 static/static/xxx 全 404）。"""
+        base = f"http://127.0.0.1:{self.port}"
+        for path, expect_type in (
+            ("/static/app.css", "text/css"),
+            ("/static/app.js", "javascript"),
+            ("/static/admin.js", "javascript"),
+        ):
+            with urllib.request.urlopen(f"{base}{path}", timeout=5) as resp:
+                self.assertEqual(resp.status, 200, path)
+                ctype = resp.headers.get("Content-Type", "")
+                self.assertIn(expect_type, ctype, path)
+                self.assertGreater(len(resp.read()), 100, path)
+
     def test_path_traversal_blocked(self) -> None:
         url = f"http://127.0.0.1:{self.port}/static/../../etc/passwd"
         try:

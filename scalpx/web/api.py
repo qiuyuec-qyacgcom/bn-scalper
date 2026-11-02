@@ -1238,6 +1238,16 @@ class Api:
         key = str(req.body.get("entity") or "")
         return get_entity(key)
 
+    @staticmethod
+    def _ai_scope(req: Request) -> str:
+        """AI 缓存作用域：以用户为界。
+
+        提示词里可能带出"只有这个人能看到的表单内容"，缓存若跨用户共享，
+        命中就会把 A 的结果回填给 B——不报错、不记录，纯粹静默越界。
+        """
+        p = req.principal
+        return f"u{p.uid}" if p is not None else "anon"
+
     def _ai_guard(self, fn):
         """把模型不可用转成 503，并保留可读原因；其余异常照常冒泡。"""
         try:
@@ -1289,8 +1299,11 @@ class Api:
         partial = req.body.get("partial") or {}
         if not isinstance(partial, dict):
             raise ApiError("BAD_REQUEST", "partial 必须是对象")
+        scope = self._ai_scope(req)
         return self._ai_guard(
-            lambda: self.ai.suggest(spec, partial, str(req.body.get("hint") or ""))
+            lambda: self.ai.suggest(
+                spec, partial, str(req.body.get("hint") or ""), scope=scope
+            )
         )
 
     def h_ai_fix(self, req: Request) -> dict:
@@ -1303,7 +1316,8 @@ class Api:
         issues = self.store.validate(spec, payload)["issues"]
         if not issues:
             return {"mode": self.ai.status()["mode"], "payload": payload, "changes": [], "unresolved": []}
-        return self._ai_guard(lambda: self.ai.fix(spec, payload, issues))
+        scope = self._ai_scope(req)
+        return self._ai_guard(lambda: self.ai.fix(spec, payload, issues, scope=scope))
 
     def h_ai_command(self, req: Request) -> dict:
         text = str(req.body.get("text") or "").strip()
@@ -1311,7 +1325,8 @@ class Api:
             raise ApiError("BAD_REQUEST", "请输入指令", 400)
         if len(text) > 500:
             raise ApiError("BAD_REQUEST", "指令过长（上限 500 字）", 400)
-        result = self._ai_guard(lambda: self.ai.command(text))
+        scope = self._ai_scope(req)
+        result = self._ai_guard(lambda: self.ai.command(text, scope=scope))
         plan = result.get("plan") or {}
         # 预览：把计划跑一遍 schema 校验，让用户在确认前就看到会不会失败
         _, issues = validate_plan(plan)
@@ -1350,7 +1365,10 @@ class Api:
             else:
                 result = self.store.list(spec, limit=200)
         except EntityError as exc:
-            explanation = self.ai.explain(spec, action, False, exc.message, [i.as_dict() for i in exc.issues], None)
+            explanation = self.ai.explain(
+                spec, action, False, exc.message, [i.as_dict() for i in exc.issues], None,
+                scope=self._ai_scope(req),
+            )
             raise ApiError(
                 exc.code,
                 exc.message,
@@ -1362,7 +1380,9 @@ class Api:
             uid=p.uid, username=p.username, action=f"ai_{action}",
             target=spec.key, detail=plan.get("summary", "")[:200], ip=req.ip,
         )
-        explanation = self.ai.explain(spec, action, True, plan.get("summary", ""), [], result)
+        explanation = self.ai.explain(
+            spec, action, True, plan.get("summary", ""), [], result, scope=self._ai_scope(req)
+        )
         return {"entity": spec.key, "action": action, "result": result, "explanation": explanation}
 
     def h_ai_explain(self, req: Request) -> dict:
@@ -1374,8 +1394,9 @@ class Api:
         data = req.body.get("data")
         if not isinstance(issues, list):
             issues = []
+        scope = self._ai_scope(req)
         return self._ai_guard(
-            lambda: self.ai.explain(spec, action, ok, message, issues, data)
+            lambda: self.ai.explain(spec, action, ok, message, issues, data, scope=scope)
         )
 
     def h_run_delete(self, req: Request) -> dict:

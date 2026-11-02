@@ -248,8 +248,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------------ #
     def _serve_static(self, path: str) -> None:
+        # 页面里的资源引用是 /static/xxx，必须先把前缀剥掉，
+        # 否则会拼成 <static>/static/xxx 而全部 404。
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
-        if rel == "admin":
+        if rel.startswith("static/"):
+            rel = rel[len("static/"):]
+        if rel in ("admin", "admin/"):
             rel = "admin.html"
         if not rel or rel.endswith("/"):
             rel += "index.html"
