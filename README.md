@@ -382,6 +382,9 @@ python -m unittest discover -s tests -t . -v
 
 # 浏览器冒烟（需要本机有 Chrome/Edge；零依赖，走 DevTools 协议）
 python scripts/ui_smoke.py
+
+# 安装器单测（不需要 root / systemd）
+bash tests/test_installer.sh
 ```
 
 当前 **200+ 个用例**，覆盖：指标口径、撮合语义、保护单不变量、成本闸门、微观结构

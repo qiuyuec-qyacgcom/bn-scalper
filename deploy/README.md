@@ -78,9 +78,11 @@
 [3/8] 目录与用户    系统用户、data/ web/ runs/ logs/、权限
 [4/8] 备份与同步    备份旧代码与配置 → rsync 或 tar 管道同步（排除 data/runs/logs/config）
 [5/8] 配置与账号    secret.key（已有则保留）、TOML（缺失才复制）、用户表为空才建 admin
+                    **全部以运行用户身份创建**，结束后回收属主
 [6/8] 服务注册      systemd unit（安全加固）/ OpenRC 脚本 / nohup 降级、logrotate
-[7/8] 启动服务      停旧进程 → 启动 → 记录 pid
-[8/8] 健康校验      轮询 /api/health（≤40s）→ 校验 web_db/static/config → 跑 scalpx.web check
+[7/8] 启动服务      以运行用户试跑自检 → 停旧进程 → 启动 → 记录 pid
+[8/8] 健康校验      轮询 /api/health（≤40s）→ 校验 web_db/static/config
+                    **服务反复重启时立即失败**，不死等满 40s
 ```
 
 每一步都会打印耗时；健康检查每 5 秒输出一个点，避免自动化环境误判为卡死。
@@ -221,6 +223,7 @@ status=ok version=1.0.0 uptime=4s
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
+| 服务反复重启，日志 `PermissionError: .../data/web/secret.key` | root 创建的 0600 密钥，服务以非 root 用户运行读不了 | v2.1 起运行时文件由服务用户创建并在启动前校验属主；旧环境直接 `chown -R scalpx:scalpx /opt/scalpx` 后 `systemctl restart scalpx-web` |
 | `需要 bash >= 4.0` | Alpine 默认 ash | `apk add bash` 后重跑 |
 | 端口占用（退出码 3） | 已有实例或其它服务 | `--port` 换端口，或先停旧服务 |
 | 依赖安装失败（退出码 4） | 无外网 / 源不可用 | 预装 Python ≥3.11 后用 `--skip-deps` |
@@ -237,3 +240,26 @@ status=ok version=1.0.0 uptime=4s
 | `install.sh` | 安装器主程序（安装/升级/回滚/卸载/自检） |
 | `uninstall.sh` | 卸载薄封装，保证默认保留数据 |
 | `healthcheck.sh` | 外部健康探针（HTTP，退出码语义化） |
+
+### 属主与权限模型
+
+| 对象 | 属主 | 权限 | 说明 |
+|---|---|---|---|
+| 安装目录 | `scalpx` | 755 | 服务用户需要可读程序文件 |
+| `data/`、`runs/`、`logs/` | `scalpx` | 755 | 服务需要写 |
+| `data/web/secret.key` | `scalpx` | **600** | 会话签名密钥，只有服务能读 |
+| `data/web/initial_credentials.txt` | `root` | **600** | 初始口令，只给运维看 |
+| systemd unit | `root` | 644 | 由 systemd 读取 |
+
+**为什么强调这点**：v2.0 用 root 生成 `secret.key`（0600），服务以 `scalpx` 启动时报
+`PermissionError`，表现为"装完了但起不来"。v2.1 改为运行时文件一律以服务用户创建，
+并在启动前用 `runuser -u scalpx -- python -m scalpx.web check` 实测一次，不通过直接终止。
+
+### 安装器自身的测试
+
+```bash
+bash tests/test_installer.sh      # 11 项断言，不需要 root / systemd
+```
+
+覆盖：`as_run_user` 切身份、`fix_ownership` 的三种短路、参数校验退出码、回滚栈顺序。
+`install.sh` 末尾有 `BASH_SOURCE` 保护，被 source 时只加载函数不执行主流程。

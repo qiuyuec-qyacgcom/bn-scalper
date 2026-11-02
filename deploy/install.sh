@@ -34,7 +34,7 @@ export PYTHONUTF8="1"
 # =============================================================================
 readonly APP_NAME="scalpx-web"
 readonly SERVICE_NAME="scalpx-web"
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly MIN_PY_MINOR=11
 
 readonly DEFAULT_PORT=8787
@@ -223,6 +223,35 @@ run_privileged_tee() {
   local path="$1"
   if [ -n "$SUDO" ]; then "$SUDO" tee "$path" > /dev/null; else tee "$path" > /dev/null; fi
   _log "[WRITE] $path"
+}
+
+# 以**服务运行用户**身份执行命令。
+# 关键：secret.key / web.db 这类运行时文件必须由运行用户创建，
+# 否则 root 建的 0600 文件会让服务启动时直接 PermissionError。
+as_run_user() {
+  if [ "$IS_ROOT" != "1" ] || [ "$RUN_USER" = "root" ] || [ "$RUN_USER" = "$(id -un)" ]; then
+    "$@"
+    return $?
+  fi
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$RUN_USER" -- "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -u "$RUN_USER" -- "$@"
+  else
+    su -s /bin/sh -c "$(printf '%q ' "$@")" "$RUN_USER"
+  fi
+}
+
+# 把安装目录整体交还给运行用户（root 安装时才需要）
+fix_ownership() {
+  [ "$DRY_RUN" = "1" ] && return 0
+  [ "$IS_ROOT" = "1" ] || return 0
+  [ "$RUN_USER" = "root" ] && return 0
+  chown -R "$RUN_USER":"$RUN_USER" "$INSTALL_DIR" 2>/dev/null || {
+    log_warn "chown 失败：$INSTALL_DIR"
+    return 1
+  }
+  return 0
 }
 
 # =============================================================================
@@ -674,7 +703,8 @@ ensure_secret() {
     log_dim "  [dry-run] 生成 $secret_file"
     return 0
   fi
-  "$PY_BIN" - "$secret_file" <<'PY'
+  # 必须以**运行用户**身份创建：root 建的 0600 文件，服务进程读不了
+  as_run_user "$PY_BIN" - "$secret_file" <<'PY'
 import base64, os, sys
 path = sys.argv[1]
 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -707,8 +737,16 @@ ensure_configs() {
 
 ensure_admin() {
   local cred_file="$INSTALL_DIR/data/web/initial_credentials.txt"
+
+  # 预演模式下系统用户尚未创建（run_priv 不会真执行），不能真去切身份
+  if [ "$DRY_RUN" = "1" ]; then
+    log_dim "  [dry-run] 视用户表情况创建 admin，并写入 $cred_file"
+    return 0
+  fi
+
   local count
-  count=$("$PY_BIN" - "$INSTALL_DIR" <<'PY'
+  # 以运行用户身份查询：WebRepo 打开时会建表，用 root 打开会生成 root 属主的库
+  count=$(as_run_user "$PY_BIN" - "$INSTALL_DIR" <<'PY'
 import sys
 sys.path.insert(0, sys.argv[1])
 try:
@@ -724,10 +762,6 @@ PY
     log_dim "已存在 ${count} 个账号，跳过初始化"
     return 0
   fi
-  if [ "$DRY_RUN" = "1" ]; then
-    log_dim "  [dry-run] 创建管理员账号并写入 $cred_file"
-    return 0
-  fi
 
   local admin_pw
   admin_pw=$("$PY_BIN" - <<'PY'
@@ -735,8 +769,8 @@ import secrets
 print(secrets.token_urlsafe(12))
 PY
 )
-  ( cd "$INSTALL_DIR" && "$PY_BIN" -m scalpx.web create-user \
-      --username admin --password "$admin_pw" --role admin >/dev/null )
+  as_run_user "$PY_BIN" -m scalpx.web create-user --root "$INSTALL_DIR" \
+    --username admin --password "$admin_pw" --role admin >/dev/null
   push_rollback "移除初始管理员账号" \
     "cd '$INSTALL_DIR' && '$PY_BIN' -c \"from scalpx.web.repo import WebRepo; r=WebRepo('data/web.db'); r._conn.execute('DELETE FROM users WHERE username=?',('admin',)); r._conn.commit(); r.close()\" 2>/dev/null || true"
 
@@ -753,11 +787,42 @@ PY
   log_ok "管理员账号已创建，凭据：$cred_file"
 }
 
+# 以运行用户身份试跑一次自检：能打开库、能读密钥，才算真的能启动
+verify_service_user_access() {
+  [ "$DRY_RUN" = "1" ] && return 0
+  [ "$NO_SERVICE" = "1" ] && return 0
+  [ "$IS_ROOT" = "1" ] || return 0
+  [ "$RUN_USER" = "root" ] && return 0
+
+  local out
+  log_info "以 $RUN_USER 身份试运行自检"
+  if out=$(as_run_user "$PY_BIN" -m scalpx.web check --root "$INSTALL_DIR" 2>&1); then
+    log_ok "运行用户权限正常"
+    return 0
+  fi
+
+  log_warn "自检未通过，校正属主后重试：$INSTALL_DIR"
+  fix_ownership || true
+  if out=$(as_run_user "$PY_BIN" -m scalpx.web check --root "$INSTALL_DIR" 2>&1); then
+    log_ok "属主校正后恢复正常"
+    return 0
+  fi
+
+  # 仍失败：把 check 的真实结论打出来，避免一上来就误判成"权限问题"
+  log_err "以 $RUN_USER 身份仍无法通过自检，服务大概率起不来："
+  printf '%s\n' "$out" | tail -n 12 | sed 's/^/    /' || true
+  id "$RUN_USER" 2>&1 | sed 's/^/    /' || true
+  ls -ln "$INSTALL_DIR/data/web" 2>&1 | head -6 | sed 's/^/    /' || true
+  die "运行用户 $RUN_USER 无法访问安装目录" 5
+}
+
 configure() {
   step "生成配置与账号"
   ensure_secret
   ensure_configs
   ensure_admin
+  # 运行时文件（密钥/用户库/凭据）都在这一步产生，必须回收属主
+  fix_ownership || log_warn "属主校正失败，启动前会再试一次"
   step_done
 }
 
@@ -938,6 +1003,9 @@ start_service() {
     return 0
   fi
 
+  # 启动前最后一道防线：确认运行用户真的能读密钥、能开库
+  verify_service_user_access
+
   case "$INIT_SYS" in
     systemd)
       run_priv "停止既有服务" systemctl stop "$SERVICE_NAME" || true
@@ -949,6 +1017,22 @@ start_service() {
   esac
   log_ok "服务已启动"
   step_done
+}
+
+# 失败时输出能直接定位权限问题的信息
+dump_failure_context() {
+  log_err "健康检查未通过，采集现场信息"
+  if [ "$INIT_SYS" = "systemd" ]; then
+    systemctl --no-pager status "$SERVICE_NAME" 2>&1 | head -n 18 | sed 's/^/    /' || true
+    journalctl -u "$SERVICE_NAME" -n 25 --no-pager 2>/dev/null | sed 's/^/    /' || true
+  fi
+  [ -f "$INSTALL_DIR/logs/web.log" ] && tail -n 25 "$INSTALL_DIR/logs/web.log" | sed 's/^/    /' || true
+  if [ "$IS_ROOT" = "1" ] && [ "$RUN_USER" != "root" ]; then
+    log_err "属主与权限（运行用户 $RUN_USER）："
+    ls -ln "$INSTALL_DIR/data/web" 2>&1 | head -n 8 | sed 's/^/    /' || true
+    as_run_user sh -c "test -r '$INSTALL_DIR/data/web/secret.key'" 2>/dev/null \
+      && log_dim "  密钥可读" || log_err "  密钥不可读：$INSTALL_DIR/data/web/secret.key"
+  fi
 }
 
 health_check() {
@@ -982,18 +1066,31 @@ PY
     i=$((i + 1))
     # 每 5 秒打一个点，避免自动化环境误以为卡死
     if [ $((i % 5)) -eq 0 ]; then printf '%s.%s' "$C_GRAY" "$C_RESET"; fi
+
+    # 服务在反复重启（Restart=always）时不要傻等满 40 秒，
+    # 直接判定失败并打印现场——早失败 30 秒，排障体验完全不同。
+    if [ "$INIT_SYS" = "systemd" ] && [ "$NO_SERVICE" = "0" ]; then
+      local restarts
+      restarts=$(systemctl show -p NRestarts --value "$SERVICE_NAME" 2>/dev/null || echo 0)
+      case "${restarts:-0}" in
+        ''|*[!0-9]*) restarts=0 ;;
+      esac
+      if [ "$restarts" -ge 2 ]; then
+        log_err "服务已重启 ${restarts} 次（启动即崩溃）"
+        dump_failure_context
+        die "服务无法稳定运行，见上面的日志" 6
+      fi
+    fi
+
     if [ "$i" -gt "$HEALTH_RETRIES" ]; then
       log_err "健康检查超时"
-      if [ "$INIT_SYS" = "systemd" ]; then
-        systemctl --no-pager status "$SERVICE_NAME" 2>&1 | head -n 15 | sed 's/^/    /' || true
-      fi
-      [ -f "$INSTALL_DIR/logs/web.log" ] && tail -n 20 "$INSTALL_DIR/logs/web.log" | sed 's/^/    /' || true
+      dump_failure_context
       die "服务未能在 ${HEALTH_RETRIES}s 内就绪" 6
     fi
   done
 
-  log_info "部署自检："
-  ( cd "$INSTALL_DIR" && "$PY_BIN" -m scalpx.web check --root "$INSTALL_DIR" ) \
+  log_info "部署自检（以运行用户 $RUN_USER 身份）："
+  as_run_user "$PY_BIN" -m scalpx.web check --root "$INSTALL_DIR" 2>&1 \
     | sed 's/^/    /' || log_warn "自检有告警（不影响启动）"
   step_done
 }
@@ -1218,4 +1315,7 @@ main() {
   printf '%s安装流程结束（退出码 0）%s\n\n' "$C_GREEN" "$C_RESET"
 }
 
-main "$@"
+# 仅在直接执行时跑主流程；被 source 时只暴露函数，便于单测
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
